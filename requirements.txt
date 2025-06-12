@@ -1,0 +1,19 @@
+pytesseract
+pdf2image
+Pillow
+PyPDF2
+poppler-utils
+fuzzywuzzy
+python-Levenshtein
+easyocr
+opencv-python
+cv2
+numpy as np
+frappe
+json
+re
+base64
+io
+traceback
+requests
+uuid

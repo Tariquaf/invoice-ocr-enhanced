@@ -1,0 +1,125 @@
+{
+ "actions": [],
+ "allow_rename": 1,
+ "autoname": "format:IU-{YY}-{MM}-{###}",
+ "creation": "2025-05-24 00:30:47.121979",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "party_type",
+  "party",
+  "create_invoice",
+  "date",
+  "column_break_wauc",
+  "file",
+  "ocr_status",
+  "amended_from",
+  "extracted_data_section",
+  "extracted_data",
+  "invoice_item_section",
+  "invoice_upload_item"
+ ],
+ "fields": [
+  {
+   "fieldname": "party_type",
+   "fieldtype": "Select",
+   "label": "Party Type",
+   "options": "Customer\nSupplier"
+  },
+  {
+   "fieldname": "party",
+   "fieldtype": "Dynamic Link",
+   "label": "Party",
+   "options": "party_type"
+  },
+  {
+   "allow_on_submit": 1,
+   "fieldname": "ocr_status",
+   "fieldtype": "Select",
+   "label": "OCR Status",
+   "options": "Pending\nProcessing\nExtracted\nFailed"
+  },
+  {
+   "fieldname": "create_invoice",
+   "fieldtype": "Button",
+   "label": "Create Invoice"
+  },
+  {
+   "allow_on_submit": 1,
+   "fieldname": "extracted_data",
+   "fieldtype": "Code",
+   "label": "Extracted JSON"
+  },
+  {
+   "fieldname": "amended_from",
+   "fieldtype": "Link",
+   "label": "Amended From",
+   "no_copy": 1,
+   "options": "Invoice Upload",
+   "print_hide": 1,
+   "read_only": 1,
+   "search_index": 1
+  },
+  {
+   "allow_on_submit": 1,
+   "fieldname": "file",
+   "fieldtype": "Attach",
+   "label": "Upload File"
+  },
+  {
+   "fieldname": "column_break_wauc",
+   "fieldtype": "Column Break"
+  },
+  {
+   "collapsible": 1,
+   "fieldname": "extracted_data_section",
+   "fieldtype": "Section Break",
+   "label": "Extracted Data"
+  },
+  {
+   "fieldname": "invoice_item_section",
+   "fieldtype": "Section Break",
+   "label": "Invoice Item"
+  },
+  {
+   "fieldname": "invoice_upload_item",
+   "fieldtype": "Table",
+   "label": "Invoice Upload Item",
+   "options": "Invoice Upload Item"
+  },
+  {
+   "default": "Today",
+   "fieldname": "date",
+   "fieldtype": "Date",
+   "label": "Date"
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "is_submittable": 1,
+ "links": [],
+ "modified": "2025-06-04 12:36:03.895065",
+ "modified_by": "Administrator",
+ "module": "Invoice Ocr",
+ "name": "Invoice Upload",
+ "naming_rule": "Expression",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "row_format": "Dynamic",
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}
