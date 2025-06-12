@@ -1,8 +1,8 @@
-app_name = "invoice_ocr"
-app_title = "Invoice Ocr"
-app_publisher = "mohtashim"
-app_description = "invoice ocr"
-app_email = "shoaibmohtashim973@gmail.com"
+app_name = "invoice_ocr_enhanced"
+app_title = "Invoice Ocr (Enhanced)"
+app_publisher = "Tariq Mushtaq"
+app_description = "invoice ocr (enhanced)"
+app_email = "mail@agrovisions.com"
 app_license = "mit"
 # required_apps = []
 

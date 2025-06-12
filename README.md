@@ -46,7 +46,7 @@ sudo apt install libgl1-mesa-glx  # For OpenCV
 
 # Get the app from GitHub
 
-[bench get-app https://github.com/Tariquaf/Invoice-OCR.git
+bench get-app https://github.com/Tariquaf/invoice-ocr-enhanced.git
 
 # Activate your Frappe virtual environment
 
