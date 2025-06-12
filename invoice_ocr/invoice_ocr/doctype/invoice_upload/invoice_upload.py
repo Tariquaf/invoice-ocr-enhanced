@@ -546,9 +546,35 @@ class InvoiceUpload(Document):
         return items
 
     def extract_dates(self, text):
-        """Extract dates from the invoice header"""
+        """Extract dates from the invoice header with improved table parsing"""
         dates = {}
-        # Improved regex to handle pipe-separated tables
+        # Try multi-line approach first
+        lines = text.splitlines()
+        header_found = False
+        date_line = None
+        
+        # Look for the header line
+        for i, line in enumerate(lines):
+            if "Invoice Date" in line and "Due Date" in line and "Delivery Date" in line:
+                header_found = True
+                # The next line should contain the dates
+                if i + 1 < len(lines):
+                    date_line = lines[i + 1]
+                break
+        
+        if header_found and date_line:
+            # Extract dates from the value line
+            date_values = re.findall(r'(\d{1,2}/\d{1,2}/\d{4})', date_line)
+            if len(date_values) >= 3:
+                try:
+                    dates["invoice_date"] = self.convert_date_format(date_values[0])
+                    dates["due_date"] = self.convert_date_format(date_values[1])
+                    dates["delivery_date"] = self.convert_date_format(date_values[2])
+                    return dates
+                except Exception:
+                    pass
+        
+        # Fallback to regex method for invoices without clear table structure
         header_match = re.search(
             r'Invoice\s+Date:.*?(\d{1,2}/\d{1,2}/\d{4}).*?'
             r'Due\s+Date:.*?(\d{1,2}/\d{1,2}/\d{4}).*?'
@@ -577,19 +603,36 @@ class InvoiceUpload(Document):
             return None
 
     def extract_source(self, text):
-        """Extract source (PO/SO number) from the invoice"""
-        # 1. Look for explicit "Source:" label
+        """Extract source (PO/SO number) with table awareness"""
+        # 1. Table-based extraction - look for source in the date table
+        lines = text.splitlines()
+        source_value = None
+        
+        # Find the date header line
+        for i, line in enumerate(lines):
+            if "Invoice Date" in line and "Source" in line:
+                # Next line should contain values
+                if i + 1 < len(lines):
+                    value_line = lines[i + 1]
+                    parts = [p.strip() for p in value_line.split('|') if p.strip()]
+                    if len(parts) >= 4:  # Expecting 4 columns: dates + source
+                        source_value = parts[-1]
+                        break
+        
+        if source_value:
+            return source_value
+        
+        # 2. Look for explicit "Source:" label
         source_match = re.search(r'Source:\s*([^\n]+)', text, re.IGNORECASE)
         if source_match:
             return source_match.group(1).strip()
         
-        # 2. Look for PO/SO numbers with various formats
+        # 3. Look for PO/SO numbers in the entire document
         po_so_patterns = [
-            r'(?:P\.?O\.?|S\.?O\.?|Order)\s*[:#]?\s*([A-Z0-9-]+)',  # PO: ABC-123
-            r'\b(?:PO|SO)\s+(\d{4,}-\d{3,})\b',                     # PO 2025-00789
-            r'Order\s+Number\s*:\s*([A-Z0-9-]+)',                    # Order Number: SO-456
-            r'Book-\s*(\d+)',                                        # Credit Book-876
-            r'^(?:Purchase|Sales)\s*Order\s*:\s*([A-Z0-9-]+)'        # Purchase Order: PO-789
+            r'\b(?:PO|SO)\s*[:#]?\s*([A-Z0-9-]+)',  # PO: ABC-123
+            r'Order\s+Number\s*:\s*([A-Z0-9-]+)',   # Order Number: SO-456
+            r'Book-\s*(\d+)',                        # Credit Book-876
+            r'^(?:Purchase|Sales)\s*Order\s*:\s*([A-Z0-9-]+)'  # Purchase Order: PO-789
         ]
         
         for pattern in po_so_patterns:
