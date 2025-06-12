@@ -89,6 +89,15 @@ class InvoiceUpload(Document):
 
             # Save extracted text for debugging
             self.raw_ocr_text = text[:10000]  # Save first 10k characters
+            
+            # Extract dates and set them
+            dates = self.extract_dates(text)
+            if dates:
+                self.invoice_date = dates.get("invoice_date") or self.invoice_date
+                self.due_date = dates.get("due_date") or self.due_date
+                self.delivery_date = dates.get("delivery_date") or self.delivery_date
+            
+            # SAVE DATES IMMEDIATELY
             self.save()
             
             items = self.extract_items(text)
@@ -206,7 +215,7 @@ class InvoiceUpload(Document):
             inv = frappe.new_doc("Purchase Invoice")
             inv.supplier = self.party
             inv.bill_no = self.name
-            inv.bill_date = self.date
+            inv.bill_date = self.invoice_date
         else:
             inv = frappe.new_doc("Sales Invoice")
             inv.customer = self.party
@@ -231,12 +240,12 @@ class InvoiceUpload(Document):
                 # Get item details
                 item_doc = frappe.get_doc("Item", item_code)
                 
-                # Determine UOM based on invoice type
+                # CONDITIONAL UOM SELECTION
                 if self.party_type == "Supplier":
                     uom = item_doc.purchase_uom or item_doc.stock_uom or "Nos"
                 else:
                     uom = item_doc.sales_uom or item_doc.stock_uom or "Nos"
-
+                
                 # Create item dictionary
                 item_dict = {
                     "item_code": item_code,
@@ -244,7 +253,7 @@ class InvoiceUpload(Document):
                     "description": item_doc.description or row.ocr_description,
                     "qty": row.qty,
                     "rate": row.rate,
-                    "uom": uom  # Use the conditionally selected UOM
+                    "uom": uom
                 }
                 
                 # Set account field based on invoice type
@@ -258,10 +267,21 @@ class InvoiceUpload(Document):
         if items_added == 0:
             frappe.throw("No valid items found to create invoice")
 
-        # Set dates
-        posting_date = getattr(self, "posting_date", None) or nowdate()
+        # SET DATES WITH OVERRIDE PRIORITY
+        posting_date = self.posting_date or self.invoice_date or nowdate()
+        due_date = self.due_date or add_days(posting_date, 30)
+        
+        # Set dates in invoice
         inv.posting_date = posting_date
-        inv.due_date = add_days(posting_date, 30)
+        inv.due_date = due_date
+        
+        # For purchase invoices, set additional dates
+        if self.party_type == "Supplier":
+            inv.bill_no = self.name
+            inv.bill_date = self.invoice_date
+            # If delivery date is available, set it
+            if self.delivery_date:
+                inv.set("delivery_date", self.delivery_date)
         
         # Calculate totals
         inv.run_method("set_missing_values")
@@ -501,6 +521,37 @@ class InvoiceUpload(Document):
                 
         return items
 
+    def extract_dates(self, text):
+        """Extract dates from the invoice header"""
+        dates = {}
+        # Improved regex to handle pipe-separated tables
+        header_match = re.search(
+            r'Invoice\s+Date:.*?(\d{1,2}/\d{1,2}/\d{4}).*?'
+            r'Due\s+Date:.*?(\d{1,2}/\d{1,2}/\d{4}).*?'
+            r'Delivery\s+Date:.*?(\d{1,2}/\d{1,2}/\d{4})',
+            text, 
+            re.IGNORECASE | re.DOTALL
+        )
+        
+        if header_match:
+            try:
+                dates["invoice_date"] = self.convert_date_format(header_match.group(1))
+                dates["due_date"] = self.convert_date_format(header_match.group(2))
+                dates["delivery_date"] = self.convert_date_format(header_match.group(3))
+            except Exception:
+                frappe.log_error("Date extraction format error", "OCR Date Error")
+        
+        return dates
+
+    def convert_date_format(self, date_str):
+        """Convert DD/MM/YYYY to YYYY-MM-DD format"""
+        try:
+            day, month, year = date_str.split('/')
+            return f"{year}-{month.zfill(2)}-{day.zfill(2)}"
+        except Exception:
+            frappe.log_error(f"Invalid date format: {date_str}", "Date Conversion Error")
+            return None
+
     def extract_party(self, text):
         """Extract the actual partner name from the invoice"""
         # 1. First look for explicit "Partner Name" field
@@ -511,8 +562,16 @@ class InvoiceUpload(Document):
             party = re.sub(r'[^\w\s\-]$', '', party).strip()
             if party:
                 return party
+        
+        # 2. Look for name in square brackets
+        bracket_match = re.search(r'\[([^\]]+)\]', text)
+        if bracket_match:
+            candidate = bracket_match.group(1).strip()
+            # Check if it looks like a name (contains letters and spaces)
+            if re.search(r'[a-zA-Z]', candidate) and ' ' in candidate:
+                return candidate
 
-        # 2. Look for the most prominent name in the top section
+        # 3. Look for the most prominent name in the top section
         # This is usually the customer/supplier name
         top_section = text.split("Invoice Date:")[0] if "Invoice Date:" in text else text[:500]
         
@@ -523,7 +582,7 @@ class InvoiceUpload(Document):
             name_candidates.sort(key=len, reverse=True)
             return name_candidates[0]
 
-        # 3. Look for other common labels
+        # 4. Look for other common labels
         party_labels = ["Customer", "Client", "Supplier", "Vendor", "Bill To", "Sold To"]
         for label in party_labels:
             pattern = re.compile(fr'{label}\s*:\s*([^\n]+)', re.IGNORECASE)
@@ -534,7 +593,7 @@ class InvoiceUpload(Document):
                 if party:
                     return party
 
-        # 4. Look for a name-like string near the invoice title
+        # 5. Look for a name-like string near the invoice title
         title_match = re.search(r'Invoice\s+\w+/\d+/\d+', text, re.IGNORECASE)
         if title_match:
             # Look before and after the title for a name
