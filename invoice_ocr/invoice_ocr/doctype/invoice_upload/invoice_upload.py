@@ -90,15 +90,21 @@ class InvoiceUpload(Document):
             # Save extracted text for debugging
             self.raw_ocr_text = text[:10000]  # Save first 10k characters
             
-            # Extract dates and set them
+            # ===== EXTRACT METADATA =====
+            # Extract dates
             dates = self.extract_dates(text)
             if dates:
                 self.invoice_date = dates.get("invoice_date") or self.invoice_date
                 self.due_date = dates.get("due_date") or self.due_date
                 self.delivery_date = dates.get("delivery_date") or self.delivery_date
             
-            # SAVE DATES IMMEDIATELY
+            # Extract source and reference
+            self.source = self.extract_source(text) or self.source
+            self.reference = self.extract_reference(text) or self.reference
+            
+            # Save immediately to capture metadata
             self.save()
+            # ===== END METADATA EXTRACTION =====
             
             items = self.extract_items(text)
             extracted_data = {
@@ -214,11 +220,21 @@ class InvoiceUpload(Document):
         if self.party_type == "Supplier":
             inv = frappe.new_doc("Purchase Invoice")
             inv.supplier = self.party
-            inv.bill_no = self.name
+            # Use extracted reference or fallback to document name
+            inv.bill_no = self.reference or self.name
             inv.bill_date = self.invoice_date
         else:
             inv = frappe.new_doc("Sales Invoice")
             inv.customer = self.party
+
+        # Set source reference (PO/SO number)
+        if self.source:
+            if self.party_type == "Supplier":
+                inv.po_no = self.source  # Purchase Order reference
+            else:
+                # For sales invoices, check if SO exists
+                if frappe.db.exists("Sales Order", self.source):
+                    inv.against_sales_order = self.source
 
         # Get appropriate account based on invoice type
         if self.party_type == "Supplier":
@@ -275,13 +291,9 @@ class InvoiceUpload(Document):
         inv.posting_date = posting_date
         inv.due_date = due_date
         
-        # For purchase invoices, set additional dates
-        if self.party_type == "Supplier":
-            inv.bill_no = self.name
-            inv.bill_date = self.invoice_date
-            # If delivery date is available, set it
-            if self.delivery_date:
-                inv.set("delivery_date", self.delivery_date)
+        # For purchase invoices, set delivery date if available
+        if self.party_type == "Supplier" and self.delivery_date:
+            inv.set("delivery_date", self.delivery_date)
         
         # Calculate totals
         inv.run_method("set_missing_values")
@@ -346,38 +358,66 @@ class InvoiceUpload(Document):
         if charge_items:
             return charge_items
 
-        # Fallback to original method if no structured data found
+        # Fallback to context-aware extraction
+        return self.extract_items_fallback(text)
+
+    def extract_items_fallback(self, text):
+        """Safe fallback that only looks in the item section"""
         items = []
-        # Look for quantity patterns in the text
-        qty_matches = re.finditer(r'(\d+,\d+\.\d{3}|\d+\.\d{3}|\d+)\s*(kg|Units)?', text, re.IGNORECASE)
+        
+        # Find the start of items section
+        start_index = text.find("DESCRIPTION")
+        if start_index == -1:
+            start_index = text.find("PARTICULARS")
+        if start_index == -1:
+            start_index = text.find("PRODUCT")
+        if start_index == -1:
+            start_index = 0
+            
+        # Find the end of items section
+        end_index = text.find("Total", start_index)
+        if end_index == -1:
+            end_index = text.find("Subtotal", start_index)
+        if end_index == -1:
+            end_index = text.find("Payment", start_index)
+        if end_index == -1:
+            end_index = len(text)
+            
+        # Focus only on the item section
+        item_section = text[start_index:end_index]
+        
+        # Look for quantity patterns in the item section
+        qty_matches = re.finditer(
+            r'(\d+,\d+\.\d{3}|\d+\.\d{3}|\d+)\s*(kg|Units)?\s+(\d+,\d+\.\d{2,3}|\d+\.\d{2,3}|\d+)',
+            item_section, 
+            re.IGNORECASE
+        )
         
         for match in qty_matches:
             try:
                 qty_str = match.group(1).replace(',', '')
                 qty = float(qty_str)
                 
-                # Find description in previous lines
-                desc_start = text.rfind('\n', 0, match.start()) + 1
-                desc_end = match.start()
-                description = text[desc_start:desc_end].strip()
+                # Get the full line
+                line_start = item_section.rfind('\n', 0, match.start()) + 1
+                line_end = item_section.find('\n', match.end())
+                full_line = item_section[line_start:line_end].strip()
+                
+                # Extract description (everything before quantity)
+                description = full_line.split(match.group(0))[0].strip()
                 
                 # Clean up description
-                description = re.sub(r'^\W+|\W+$', '', description)  # Remove surrounding symbols
-                description = re.sub(r'\s+', ' ', description)  # Collapse multiple spaces
-                description = re.sub(r'\.{3,}', '', description)  # Remove ellipses
+                description = re.sub(r'^\W+|\W+$', '', description)
+                description = re.sub(r'\s+', ' ', description)
+                description = re.sub(r'\.{3,}', '', description)
                 
                 # Skip short descriptions
                 if len(description) < 3:
                     continue
                 
-                # Find rate in the same line or next
-                rate_match = re.search(r'(\d+,\d+\.\d{2,3}|\d+\.\d{2,3}|\d+)', 
-                                      text[match.start():match.start()+100])
-                if rate_match:
-                    rate_str = rate_match.group(1).replace(',', '')
-                    rate = float(rate_str)
-                else:
-                    rate = 0.0
+                # Extract rate from the match
+                rate_str = match.group(3).replace(',', '')
+                rate = float(rate_str)
                 
                 items.append({
                     "description": description,
@@ -391,50 +431,66 @@ class InvoiceUpload(Document):
         return items
 
     def extract_table_items(self, text):
-        """Extract items from structured tables with pipe format"""
+        """Extract items from structured tables"""
         items = []
         lines = text.splitlines()
         
         # Find the start of the items table
         start_index = -1
+        header_patterns = [
+            r"DESCRIPTION.*QUANTITY.*UNIT PRICE.*AMOUNT",
+            r"PARTICULARS.*QUANTITY.*RATE.*AMOUNT",
+            r"ITEM.*QTY.*PRICE.*TOTAL"
+        ]
+        
         for i, line in enumerate(lines):
-            if "QUANTITY" in line and "UNIT PRICE" in line and "AMOUNT" in line:
+            if any(re.search(pattern, line, re.IGNORECASE) for pattern in header_patterns):
                 start_index = i + 1
                 break
         
         # If table header found, process subsequent lines
         if start_index != -1:
-            for i in range(start_index, min(start_index + 10, len(lines))):
+            for i in range(start_index, min(start_index + 20, len(lines))):
                 line = lines[i]
-                if not line.strip():
+                if not line.strip() or "---" in line or "===" in line:
                     break
                 
-                # Split line by pipe character
-                parts = [part.strip() for part in line.split('|')]
+                # Split line by pipe character or multiple spaces
+                if '|' in line:
+                    parts = [part.strip() for part in line.split('|')]
+                else:
+                    parts = re.split(r'\s{2,}', line)
+                
                 if len(parts) < 4:
                     continue
                 
                 try:
-                    description = parts[0]
-                    qty_str = parts[1].replace(',', '')
-                    rate_str = parts[2].replace(',', '')
+                    # Skip lines that are clearly not items
+                    if "Total" in parts[0] or "Subtotal" in parts[0] or "Grand" in parts[0]:
+                        continue
+                    
+                    # Combine description parts
+                    description = " ".join(parts[:-3]).strip()
+                    
+                    # Last three parts should be Qty, Rate, Amount
+                    qty_str = parts[-3].replace(',', '')
+                    rate_str = parts[-2].replace(',', '')
                     
                     # Extract quantity number
-                    qty_match = re.search(r'(\d+\.\d{3})', qty_str)
+                    qty_match = re.search(r'(\d+\.\d{3}|\d+)', qty_str)
                     if not qty_match:
                         continue
                     qty = float(qty_match.group(1))
                     
                     # Extract rate number
-                    rate_match = re.search(r'(\d+\.\d{2,3})', rate_str)
+                    rate_match = re.search(r'(\d+\.\d{2,3}|\d+)', rate_str)
                     if not rate_match:
                         continue
                     rate = float(rate_match.group(1))
                     
                     # Clean up description
-                    description = re.sub(r'\s+', ' ', description)  # Collapse spaces
-                    description = re.sub(r'\.{3,}', '', description)  # Remove ellipses
-                    description = re.sub(r'^\W+|\W+$', '', description)  # Remove surrounding symbols
+                    description = re.sub(r'\.{3,}', '', description)
+                    description = re.sub(r'^\W+|\W+$', '', description)
                     
                     # Skip short descriptions
                     if len(description) < 3:
@@ -447,38 +503,6 @@ class InvoiceUpload(Document):
                     })
                 except Exception as e:
                     continue
-        
-        # If no pipe items found, try alternative table format
-        if not items:
-            # Pattern to match table rows without pipes
-            pattern = re.compile(
-                r'^(.+?)\s+(\d{1,3}(?:,\d{3})*\.\d{3})\s*(kg|Units)?\s+(\d{1,3}(?:,\d{3})*\.\d{2,3})\s+.*?\d+\.\d{2}',
-                re.IGNORECASE
-            )
-            
-            for line in lines:
-                match = pattern.search(line)
-                if match:
-                    try:
-                        description = match.group(1).strip()
-                        qty = float(match.group(2).replace(',', ''))
-                        rate = float(match.group(4).replace(',', ''))
-                        
-                        # Clean up description
-                        description = re.sub(r'\s+', ' ', description)
-                        description = re.sub(r'\.{3,}', '', description)
-                        description = re.sub(r'^\W+|\W+$', '', description)
-                        
-                        if len(description) < 3:
-                            continue
-                            
-                        items.append({
-                            "description": description,
-                            "qty": qty,
-                            "rate": rate
-                        })
-                    except Exception as e:
-                        continue
         
         return items
 
@@ -551,6 +575,52 @@ class InvoiceUpload(Document):
         except Exception:
             frappe.log_error(f"Invalid date format: {date_str}", "Date Conversion Error")
             return None
+
+    def extract_source(self, text):
+        """Extract source (PO/SO number) from the invoice"""
+        # 1. Look for explicit "Source:" label
+        source_match = re.search(r'Source:\s*([^\n]+)', text, re.IGNORECASE)
+        if source_match:
+            return source_match.group(1).strip()
+        
+        # 2. Look for PO/SO numbers with various formats
+        po_so_patterns = [
+            r'(?:P\.?O\.?|S\.?O\.?|Order)\s*[:#]?\s*([A-Z0-9-]+)',  # PO: ABC-123
+            r'\b(?:PO|SO)\s+(\d{4,}-\d{3,})\b',                     # PO 2025-00789
+            r'Order\s+Number\s*:\s*([A-Z0-9-]+)',                    # Order Number: SO-456
+            r'Book-\s*(\d+)',                                        # Credit Book-876
+            r'^(?:Purchase|Sales)\s*Order\s*:\s*([A-Z0-9-]+)'        # Purchase Order: PO-789
+        ]
+        
+        for pattern in po_so_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+        
+        return None
+
+    def extract_reference(self, text):
+        """Extract reference number from the invoice"""
+        # 1. Look for invoice number pattern
+        inv_patterns = [
+            r'Invoice\s+([A-Z]+/\d{4}/\d{5})',           # Invoice INV/2025/00789
+            r'Ref(?:erence)?\s*[:#]?\s*([A-Z0-9-]+)',     # Ref: ABC-123
+            r'Document\s+Number\s*:\s*([A-Z0-9-]+)',      # Document Number: DOC-456
+            r'Bill\s+No\.?\s*:\s*([A-Z0-9-]+)',           # Bill No: BILL-789
+            r'^\s*([A-Z]{2,}\d{4,})\s*$'                  # Standalone reference like INV202500789
+        ]
+        
+        for pattern in inv_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+        
+        # 2. Look for payment communication reference
+        payment_match = re.search(r'Payment\s+Communication:\s*([^\n]+)', text, re.IGNORECASE)
+        if payment_match:
+            return payment_match.group(1).strip()
+            
+        return None
 
     def extract_party(self, text):
         """Extract the actual partner name from the invoice"""
@@ -652,6 +722,10 @@ class InvoiceUpload(Document):
         best_match = None
         best_score = 0
         
+        # Skip numeric-only strings
+        if re.match(r'^\d+$', clean_text):
+            return None
+            
         for item in all_items:
             # Clean match text similarly
             clean_match = item["match_text"]
