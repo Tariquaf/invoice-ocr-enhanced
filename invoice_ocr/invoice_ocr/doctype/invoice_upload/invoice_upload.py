@@ -231,6 +231,12 @@ class InvoiceUpload(Document):
                 # Get item details
                 item_doc = frappe.get_doc("Item", item_code)
                 
+                # Determine UOM based on invoice type
+                if self.party_type == "Supplier":
+                    uom = item_doc.purchase_uom or item_doc.stock_uom or "Nos"
+                else:
+                    uom = item_doc.sales_uom or item_doc.stock_uom or "Nos"
+
                 # Create item dictionary
                 item_dict = {
                     "item_code": item_code,
@@ -238,7 +244,7 @@ class InvoiceUpload(Document):
                     "description": item_doc.description or row.ocr_description,
                     "qty": row.qty,
                     "rate": row.rate,
-                    "uom": item_doc.stock_uom or "Nos"
+                    "uom": uom  # Use the conditionally selected UOM
                 }
                 
                 # Set account field based on invoice type
