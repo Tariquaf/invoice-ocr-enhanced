@@ -1,6 +1,6 @@
-# 📄 Invoice OCR App for ERPNext v15 (Enhanced Fork)
+# 📄 Invoice OCR (Enhanced) App for ERPNext v15 
 
-This repository offers a significantly improved version of the Invoice OCR tool, originally created by [Mohtashim-1](https://github.com/Mohtashim-1/Invoice-OCR) and later enhanced by [Tariquaf](https://github.com/Tariquaf/Invoice-OCR). It automates data extraction from scanned PDF or image invoices and creates Sales or Purchase Invoices in ERPNext using OCR.
+This repository offers a significantly improved version of the Invoice OCR tool, originally created by [Mohtashim-1](https://github.com/Mohtashim-1/Invoice-OCR). It automates data extraction from scanned PDF or image invoices and creates Sales or Purchase Invoices in ERPNext using OCR.
 
 ## 🚀 What's New in This Fork
 
