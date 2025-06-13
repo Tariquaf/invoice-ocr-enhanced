@@ -12,6 +12,7 @@ from frappe.utils.file_manager import get_file_path
 from frappe.model.document import Document
 from PIL import Image
 from frappe.utils import add_days, get_url_to_form, nowdate
+import time
 
 
 class InvoiceUpload(Document):
@@ -39,54 +40,58 @@ class InvoiceUpload(Document):
             if not self.file:
                 frappe.throw("No file attached.")
 
+            start_time = time.time()
             file_path = get_file_path(self.file)
             text = ""
 
-            # Enhanced Odoo-style preprocessing
+                        # Enhanced Odoo-style preprocessing
             def preprocess_image(pil_img):
                 try:
                     img = np.array(pil_img.convert("RGB"))
                     channels = img.shape[-1] if img.ndim == 3 else 1
                     
                     if channels == 3:
-                        # Convert to grayscale
                         gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
                     else:
                         gray = img
                         
-                    # Enhance resolution (Odoo style)
                     scaled = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-                    
-                    # Apply CLAHE for contrast enhancement (Odoo style)
                     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
                     enhanced = clahe.apply(scaled)
-                    
-                    # Apply adaptive thresholding
                     thresh = cv2.adaptiveThreshold(
                         enhanced, 255,
                         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                         cv2.THRESH_BINARY, 15, 10
                     )
-                    
-                    # Apply erosion to reduce noise (Odoo style)
                     kernel = np.ones((3, 3), np.uint8)
                     processed = cv2.erode(thresh, kernel, iterations=1)
-                    
                     return processed
                 except Exception as e:
                     frappe.log_error(f"Image processing failed: {str(e)}", "OCR Error")
-                    return pil_img  # Return original if processing fails
+                    return pil_img
+
+            # Get OCR config from site config or use default
+            ocr_config = frappe.conf.get("ocr_config", "--psm 4 --oem 3 -l eng+urd")
 
             if file_path.endswith(".pdf"):
-                images = convert_from_path(file_path, dpi=300)
+                # Convert only first 3 pages to prevent timeouts
+                images = convert_from_path(file_path, dpi=200, first_page=1, last_page=3)
                 for img in images:
+                    if time.time() - start_time > 120:  # 2-minute timeout
+                        frappe.throw("OCR processing timed out. Try with smaller file or fewer pages.")
+                    
                     processed = preprocess_image(img)
-                    text += pytesseract.image_to_string(processed, config="--psm 4 --oem 3 -l eng+urd")
+                    page_text = pytesseract.image_to_string(processed, config=ocr_config)
+                    text += page_text
+                    img.close()  # Free memory immediately
             else:
                 img = Image.open(file_path)
-                processed = preprocess_image(img)
-                text = pytesseract.image_to_string(processed, config="--psm 4 --oem 3 -l eng+urd")
-
+                try:
+                    processed = preprocess_image(img)
+                    text = pytesseract.image_to_string(processed, config=ocr_config)
+                finally:
+                    img.close()
+                    
             # Save extracted text for debugging
             self.raw_ocr_text = text[:10000]  # Save first 10k characters
             
