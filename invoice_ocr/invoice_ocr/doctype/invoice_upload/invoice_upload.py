@@ -603,39 +603,87 @@ class InvoiceUpload(Document):
             return None
 
     def extract_source(self, text):
-        """Extract source (PO/SO number) with table awareness"""
-        # 1. Table-based extraction - look for source in the date table
+        """Extract source (PO/SO number) with enhanced pattern matching"""
+        # 1. Table-based extraction - flexible header detection
         lines = text.splitlines()
         source_value = None
         
-        # Find the date header line
+        # Define all possible header keywords
+        order_keywords = [
+            "Source", "PO", "SO", "Order", "Book",
+            "Purchase Order", "Sales Order", "P.O.", "S.O."
+        ]
+        
+        # Find relevant header line
         for i, line in enumerate(lines):
-            if "Invoice Date" in line and "Source" in line:
+            # Check if any order keyword exists in line
+            if any(keyword in line for keyword in order_keywords) and (
+                "Invoice Date" in line or "Date" in line
+            ):
                 # Next line should contain values
                 if i + 1 < len(lines):
                     value_line = lines[i + 1]
-                    parts = [p.strip() for p in value_line.split('|') if p.strip()]
-                    if len(parts) >= 4:  # Expecting 4 columns: dates + source
+                    
+                    # Handle both pipe-separated and space-separated tables
+                    if '|' in value_line:
+                        parts = [p.strip() for p in value_line.split('|') if p.strip()]
+                    else:
+                        # Split on multiple spaces but preserve multi-word values
+                        parts = re.split(r'\s{2,}', value_line)
+                    
+                    # Find source column position using header keywords
+                    header_parts = re.split(r'\s{2,}|\|', line)
+                    source_col_index = None
+                    
+                    # Look for any order keyword in header
+                    for idx, header_part in enumerate(header_parts):
+                        if any(keyword in header_part for keyword in order_keywords):
+                            source_col_index = idx
+                            break
+                    
+                    # Extract from identified column or last column
+                    if source_col_index is not None and len(parts) > source_col_index:
+                        source_value = parts[source_col_index]
+                    elif parts:  # Fallback to last column
                         source_value = parts[-1]
-                        break
+                    
+                    # Clean and validate source value
+                    if source_value:
+                        # Remove date patterns (DD/MM/YYYY)
+                        source_value = re.sub(r'\d{1,2}/\d{1,2}/\d{4}', '', source_value)
+                        # Remove non-alphanumeric except hyphens and spaces
+                        source_value = re.sub(r'[^\w\s-]', '', source_value).strip()
+                        
+                        # Validate it looks like an order reference
+                        if re.search(r'[a-zA-Z]{2,}', source_value) or re.search(r'\d{3,}', source_value):
+                            return source_value
         
-        if source_value:
-            return source_value
-        
-        # 2. Look for explicit "Source:" label
-        source_match = re.search(r'Source:\s*([^\n]+)', text, re.IGNORECASE)
-        if source_match:
-            return source_match.group(1).strip()
-        
-        # 3. Look for PO/SO numbers in the entire document
-        po_so_patterns = [
-            r'\b(?:PO|SO)\s*[:#]?\s*([A-Z0-9-]+)',  # PO: ABC-123
-            r'Order\s+Number\s*:\s*([A-Z0-9-]+)',   # Order Number: SO-456
-            r'Book-\s*(\d+)',                        # Credit Book-876
-            r'^(?:Purchase|Sales)\s*Order\s*:\s*([A-Z0-9-]+)'  # Purchase Order: PO-789
+        # 2. Enhanced label-based extraction
+        label_patterns = [
+            r'(?:Purchase Order|Sales Order|PO|SO|Source|Order)[\s#:]*([A-Za-z0-9\s-]+)',
+            r'(?:P\.O\.|S\.O\.)[\s#:]*([A-Za-z0-9\s-]+)',
+            r'Book[\s-]*(\d+)'
         ]
         
-        for pattern in po_so_patterns:
+        for pattern in label_patterns:
+            matches = re.finditer(pattern, text, re.IGNORECASE)
+            for match in matches:
+                source_value = match.group(1).strip()
+                if source_value:
+                    # For book patterns, reconstruct full reference
+                    if "Book" in pattern:
+                        return f"Credit Book-{source_value}"
+                    return source_value
+        
+        # 3. Standalone order number patterns
+        order_patterns = [
+            r'\b(?:PO|SO)[\s-]*(\w{2,}\d{3,})',
+            r'\b(?:Purchase|Sales)[\s-]*Order[\s-]*(\w{2,}\d{3,})',
+            r'Order[\s-]*Number[\s-]*:\s*(\w{2,}\d{3,})',
+            r'^[\s]*([A-Z]{2,}\d{4,})\s*$'
+        ]
+        
+        for pattern in order_patterns:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
                 return match.group(1).strip()
