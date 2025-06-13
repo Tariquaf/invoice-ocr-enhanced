@@ -7,12 +7,17 @@
  "engine": "InnoDB",
  "field_order": [
   "party_type",
+  "source",
   "party",
+  "reference",
   "create_invoice",
-  "date",
   "column_break_wauc",
   "file",
   "ocr_status",
+  "invoice_date",
+  "due_date",
+  "delivery_date",
+  "posting_date",
   "amended_from",
   "extracted_data_section",
   "extracted_data",
@@ -27,28 +32,73 @@
    "options": "Customer\nSupplier"
   },
   {
+   "fieldname": "invoice_date",
+   "fieldtype": "Date",
+   "label": "Invoice Date",
+   "insert_after": "party_type"
+  },
+  {
+   "fieldname": "due_date",
+   "fieldtype": "Date",
+   "label": "Due Date",
+   "insert_after": "invoice_date"
+  },
+  {
+   "fieldname": "delivery_date",
+   "fieldtype": "Date",
+   "label": "Delivery Date",
+   "insert_after": "due_date"
+  },
+  {
+   "fieldname": "posting_date",
+   "fieldtype": "Date",
+   "label": "Posting Date",
+   "insert_after": "delivery_date"
+  },
+  {
+   "fieldname": "source",
+   "fieldtype": "Data",
+   "label": "Source (PO/SO Number)",
+   "insert_after": "posting_date"
+  },
+  {
+   "fieldname": "reference",
+   "fieldtype": "Data",
+   "label": "Reference Number",
+   "insert_after": "source"
+  },
+  {
    "fieldname": "party",
    "fieldtype": "Dynamic Link",
    "label": "Party",
-   "options": "party_type"
+   "options": "party_type",
+   "insert_after": "reference"
+  },
+  {
+   "fieldname": "create_invoice",
+   "fieldtype": "Button",
+   "label": "Create Invoice",
+   "insert_after": "party"
+  },
+  {
+   "fieldname": "column_break_wauc",
+   "fieldtype": "Column Break",
+   "insert_after": "create_invoice"
   },
   {
    "allow_on_submit": 1,
    "fieldname": "ocr_status",
    "fieldtype": "Select",
    "label": "OCR Status",
-   "options": "Pending\nProcessing\nExtracted\nFailed"
-  },
-  {
-   "fieldname": "create_invoice",
-   "fieldtype": "Button",
-   "label": "Create Invoice"
+   "options": "Pending\nProcessing\nExtracted\nFailed",
+   "insert_after": "column_break_wauc"
   },
   {
    "allow_on_submit": 1,
-   "fieldname": "extracted_data",
-   "fieldtype": "Code",
-   "label": "Extracted JSON"
+   "fieldname": "file",
+   "fieldtype": "Attach",
+   "label": "Upload File",
+   "insert_after": "ocr_status"
   },
   {
    "fieldname": "amended_from",
@@ -58,40 +108,35 @@
    "options": "Invoice Upload",
    "print_hide": 1,
    "read_only": 1,
-   "search_index": 1
-  },
-  {
-   "allow_on_submit": 1,
-   "fieldname": "file",
-   "fieldtype": "Attach",
-   "label": "Upload File"
-  },
-  {
-   "fieldname": "column_break_wauc",
-   "fieldtype": "Column Break"
+   "search_index": 1,
+   "insert_after": "file"
   },
   {
    "collapsible": 1,
    "fieldname": "extracted_data_section",
    "fieldtype": "Section Break",
-   "label": "Extracted Data"
+   "label": "Extracted Data",
+   "insert_after": "amended_from"
+  },
+  {
+   "allow_on_submit": 1,
+   "fieldname": "extracted_data",
+   "fieldtype": "Code",
+   "label": "Extracted JSON",
+   "insert_after": "extracted_data_section"
   },
   {
    "fieldname": "invoice_item_section",
    "fieldtype": "Section Break",
-   "label": "Invoice Item"
+   "label": "Invoice Item",
+   "insert_after": "extracted_data"
   },
   {
    "fieldname": "invoice_upload_item",
    "fieldtype": "Table",
    "label": "Invoice Upload Item",
-   "options": "Invoice Upload Item"
-  },
-  {
-   "default": "Today",
-   "fieldname": "date",
-   "fieldtype": "Date",
-   "label": "Date"
+   "options": "Invoice Upload Item",
+   "insert_after": "invoice_item_section"
   }
  ],
  "index_web_pages_for_search": 1,
