@@ -225,21 +225,20 @@ class InvoiceUpload(Document):
         if self.party_type == "Supplier":
             inv = frappe.new_doc("Purchase Invoice")
             inv.supplier = self.party
-            # Use extracted reference or fallback to document name
-            inv.bill_no = self.reference or self.name
-            inv.bill_date = self.invoice_date
         else:
             inv = frappe.new_doc("Sales Invoice")
             inv.customer = self.party
 
-        # Set source reference (PO/SO number)
-        if self.source:
-            if self.party_type == "Supplier":
-                inv.po_no = self.source  # Purchase Order reference
-            else:
-                # For sales invoices, check if SO exists
-                if frappe.db.exists("Sales Order", self.source):
-                    inv.against_sales_order = self.source
+        # ===== START: CHANGED SOURCE/REFERENCE MAPPING =====
+        # Handle Sales Invoice mapping
+        if self.party_type != "Supplier":  # Customer/Sales Invoice
+            inv.po_no = self.source or ""  # Source → Customer's Purchase Order
+            inv.remarks = self.reference or ""  # Reference → Remarks
+        else:  # Supplier/Purchase Invoice
+            inv.remarks = self.source or ""  # Source → Remarks
+            inv.bill_no = self.reference or self.name  # Reference → Bill No
+            inv.bill_date = self.invoice_date  # Invoice Date → Bill Date
+        # ===== END: CHANGED SOURCE/REFERENCE MAPPING =====
 
         # Get appropriate account based on invoice type
         if self.party_type == "Supplier":
