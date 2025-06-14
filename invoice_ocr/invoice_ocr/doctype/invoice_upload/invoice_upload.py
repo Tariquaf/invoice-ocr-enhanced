@@ -17,6 +17,7 @@ import time
 
 
 class InvoiceUpload(Document):
+   
     def on_submit(self):
         try:
             self.reload()
@@ -1037,6 +1038,20 @@ class InvoiceUpload(Document):
             return self.fuzzy_match_item(bracket_text, all_items)
             
         return None
+    
+    def validate(self):
+        if self.extracted_data:
+            fields = self.extract_fields_from_labeled_block(self.extracted_data)
+            
+            # Define a mapping from extracted labels to DocType field names
+            field_map = {
+                "Purchase Representative": "representative_name",
+         #       "Order Deadline": "order_deadline",
+                # Add more mappings here if needed
+            }
+            
+            for label, fieldname in field_map.items():
+                setattr(self, fieldname, fields.get(label))
 
     def fuzzy_match_party(self, party_name):
         """Fuzzy match party against existing parties"""
