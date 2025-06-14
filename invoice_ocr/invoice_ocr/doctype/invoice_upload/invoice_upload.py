@@ -219,7 +219,7 @@ class InvoiceUpload(Document):
             frappe.throw("Invoice already created for this document")
             
         # Ensure party is set and exists
-        self.ensure_party_exists()
+        # self.ensure_party_exists()
 
         # Create the appropriate invoice type
         if self.party_type == "Supplier":
@@ -615,7 +615,7 @@ class InvoiceUpload(Document):
         # Define all possible header keywords
         order_keywords = [
             "Source", "PO", "SO", "Order", "Book",
-            "Purchase Order", "Sales Order", "P.O.", "S.O."
+            "Purchase Order", "Sales Order", "P.O.", "S.O.", "Request for Quotation#", "Request for Quotation"
         ]
         
         # Find relevant header line
