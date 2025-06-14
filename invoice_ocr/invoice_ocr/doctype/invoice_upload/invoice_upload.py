@@ -6,6 +6,7 @@ import json
 import re
 import traceback
 import difflib
+import os
 from PyPDF2 import PdfReader
 from pdf2image import convert_from_path
 from frappe.utils.file_manager import get_file_path
@@ -97,10 +98,24 @@ class InvoiceUpload(Document):
                     text += page_text
                     img.close()  # Free memory immediately
             else:
+                import cv2
+                import numpy as np
                 img = Image.open(file_path)
                 try:
-                    processed = preprocess_image(img)
-                    text = pytesseract.image_to_string(processed, config=ocr_config)
+                    # Convert PIL image to OpenCV format
+                    image_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+                    # Grayscale conversion
+                    gray = cv2.cvtColor(image_cv, cv2.COLOR_BGR2GRAY)
+
+                    # Thresholding to improve OCR accuracy
+                    _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+                    # Convert back to PIL for pytesseract
+                    processed_img = Image.fromarray(thresh)
+
+                    # OCR on processed image
+                    text = pytesseract.image_to_string(processed_img, config=ocr_config)
                 finally:
                     img.close()
                     
