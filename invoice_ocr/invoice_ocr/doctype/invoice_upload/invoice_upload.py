@@ -402,10 +402,31 @@ class InvoiceUpload(Document):
             frappe.throw("No default Income Account found for the company.")
         return account
 
+    def extract_fields_from_labeled_block(self, text):
+        import re
+        lines = text.splitlines()
+        results = {}
+
+        for i, line in enumerate(lines):
+            if line.count(':') >= 2 and i + 1 < len(lines):
+                titles = [t.strip() for t in line.split(':') if t.strip()]
+                values_line = lines[i + 1].strip()
+                values = values_line.split()
+
+                if len(titles) == 2 and len(values) >= 2:
+                    for vi, v in enumerate(values):
+                        if re.match(r'\d{2}/\d{2}/\d{4}', v):
+                            rep_name = " ".join(values[:vi])
+                            order_date = v + " " + " ".join(values[vi+1:])
+                            results[titles[0]] = rep_name
+                            results[titles[1]] = order_date
+                            break
+
+        return results
+    
     def extract_representative(self, text):
-        """Extract representative name from invoice (FIXED)"""
+        """Extract representative name from invoice (corrected with next-line logic)"""
         try:
-            # First, try to find the representative using explicit patterns
             patterns = [
                 r'Sales\s*Person\s*[:\-]?\s*([^\n\d]+)',
                 r'Purchase\s*Representative\s*[:\-]?\s*([^\n\d]+)',
@@ -421,26 +442,39 @@ class InvoiceUpload(Document):
                 match = re.search(pattern, text, re.IGNORECASE)
                 if match:
                     name = match.group(1).strip()
-                    # Clean name and remove any trailing numbers/dates
-                    name = re.sub(r'\s+\d+.*$', '', name)  # Remove trailing numbers
+                    name = re.sub(r'\s+\d+.*$', '', name)
                     name = re.sub(r'[^\w\s\.-]', '', name).strip()
                     if name and len(name) > 3:
                         return name
-            
-            # If explicit patterns fail, look for name after "Purchase Representative"
-            rep_match = re.search(r'Purchase Representative[^\n]*\n([^\n]+)', text, re.IGNORECASE)
-            if rep_match:
-                name = rep_match.group(1).strip()
-                # Clean name and remove any trailing numbers/dates
-                name = re.sub(r'\s+\d+.*$', '', name)  # Remove trailing numbers
-                name = re.sub(r'[^\w\s\.-]', '', name).strip()
-                if name and len(name) > 3:
-                    return name
-                    
+
+            # Fallback: look for "Purchase Representative" and skip misleading inline labels
+            lines = text.split("\n")
+            for i, line in enumerate(lines):
+                if "purchase representative" in line.lower():
+                    # If the line contains "Order Deadline", we skip extracting from this line
+                    if "order deadline" in line.lower():
+                        # Go to next line
+                        if i + 1 < len(lines):
+                            next_line = lines[i + 1].strip()
+                            name = re.sub(r'\s+\d+.*$', '', next_line)
+                            name = re.sub(r'[^\w\s\.-]', '', name).strip()
+                            if name and len(name) > 3 and not re.search(r'\d', name):
+                                return name
+                    else:
+                        # Safe to try extracting from the same line
+                        parts = re.split(r':', line)
+                        if len(parts) > 1:
+                            name = parts[1].strip()
+                            name = re.sub(r'\s+\d+.*$', '', name)
+                            name = re.sub(r'[^\w\s\.-]', '', name).strip()
+                            if name and len(name) > 3 and not re.search(r'\d', name):
+                                return name
+
             return None
         except Exception as e:
             frappe.log_error(f"extract_representative failed: {str(e)}\n{traceback.format_exc()}", "Representative Extraction Error")
             return None
+
 
     def fuzzy_match_representative(self, name):
         """Fuzzy match representative name to users"""
@@ -849,62 +883,82 @@ class InvoiceUpload(Document):
             
         return None
 
+    import re
+
     def extract_party(self, text):
-        """Extract the actual partner name from the invoice"""
-        # 1. First look for explicit "Partner Name" field
-        partner_match = re.search(r'Partner\s*Name\s*:\s*([^\n]+)', text, re.IGNORECASE)
+        """Extract the actual partner name from the invoice text (OCR-tolerant)"""
+
+        # Normalize text spacing and remove carriage returns
+        text = text.replace('\r', '').replace('  ', ' ')
+
+        # Fix common OCR errors
+        def clean_common_ocr_errors(s):
+            s = s.replace(' lron ', ' Iron ')
+            s = s.replace(' lron', ' Iron')  # Edge case without spacing
+            return s
+
+        # 1. Try a global match anywhere in the text
+        partner_match = re.search(r'Partner\s*Name\s*[:\-]?\s*([A-Z][a-zA-Z\s&.,\-]+)', text, re.IGNORECASE)
         if partner_match:
-            party = partner_match.group(1).strip()
-            # Remove any trailing non-alphanumeric characters
-            party = re.sub(r'[^\w\s\-]$', '', party).strip()
+            party = clean_common_ocr_errors(partner_match.group(1).strip())
             if party:
                 return party
-        
-        # 2. Look for name in square brackets
-        bracket_match = re.search(r'\[([^\]]+)\]', text)
-        if bracket_match:
-            candidate = bracket_match.group(1).strip()
-            # Check if it looks like a name (contains letters and spaces)
-            if re.search(r'[a-zA-Z]', candidate) and ' ' in candidate:
-                return candidate
 
-        # 3. Look for the most prominent name in the top section
-        # This is usually the customer/supplier name
-        top_section = text.split("Invoice Date:")[0] if "Invoice Date:" in text else text[:500]
-        
-        # Find the longest word sequence that looks like a name
-        name_candidates = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b', top_section)
-        if name_candidates:
-            # Get the longest candidate as it's likely the partner name
-            name_candidates.sort(key=len, reverse=True)
-            return name_candidates[0]
+        # 2. Fallback: line-by-line scan for "Partner Name"
+        for line in text.split('\n'):
+            if "partner name" in line.lower():
+                match = re.search(r'Partner\s*Name\s*[:\-]?\s*([A-Z][a-zA-Z\s&.,\-]+)', line, re.IGNORECASE)
+                if match:
+                    party = clean_common_ocr_errors(match.group(1).strip())
+                    if party:
+                        return party
 
-        # 4. Look for other common labels
-        party_labels = ["Customer", "Client", "Supplier", "Vendor", "Bill To", "Sold To"]
+        # 3. Other common labels (Customer, Supplier, Invoice To, etc.)
+        party_labels = [
+            r"Invoice\s*To", r"Bill\s*To", r"Sold\s*To", r"Customer", r"Client", r"Supplier", r"Vendor"
+        ]
         for label in party_labels:
-            pattern = re.compile(fr'{label}\s*:\s*([^\n]+)', re.IGNORECASE)
+            pattern = re.compile(fr'{label}\s*[:\-]?\s*([^\n]+)', re.IGNORECASE)
             match = pattern.search(text)
             if match:
-                party = match.group(1).strip()
+                party = clean_common_ocr_errors(match.group(1).strip())
                 party = re.sub(r'[^\w\s\-]$', '', party).strip()
                 if party:
                     return party
 
-        # 5. Look for a name-like string near the invoice title
-        title_match = re.search(r'Invoice\s+\w+/\d+/\d+', text, re.IGNORECASE)
+        # 4. Look for name in square brackets
+        bracket_match = re.search(r'\[([^\]]+)\]', text)
+        if bracket_match:
+            candidate = bracket_match.group(1).strip()
+            if re.search(r'[a-zA-Z]', candidate) and ' ' in candidate and not re.search(r'\d{5,}', candidate):
+                return clean_common_ocr_errors(candidate)
+
+        # 5. Try to extract a name-like phrase near the top of the document
+        top_section = text.split("Invoice Date:")[0] if "Invoice Date:" in text else text[:500]
+        name_candidates = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b', top_section)
+        if name_candidates:
+            name_candidates.sort(key=len, reverse=True)
+            return clean_common_ocr_errors(name_candidates[0])
+
+        # 6. Scan for name near invoice ID
+        title_match = re.search(r'Invoice\s+\w+[\/\-]?\d+[\/\-]?\d*', text, re.IGNORECASE)
         if title_match:
-            # Look before and after the title for a name
-            start_pos = max(0, title_match.start() - 100)
-            end_pos = min(len(text), title_match.end() + 100)
+            start_pos = max(0, title_match.start() - 150)
+            end_pos = min(len(text), title_match.end() + 150)
             context = text[start_pos:end_pos]
-            
-            # Find the most prominent name in this context
             name_candidates = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b', context)
             if name_candidates:
                 name_candidates.sort(key=len, reverse=True)
-                return name_candidates[0]
+                return clean_common_ocr_errors(name_candidates[0])
+
+        # 7. Urdu fallback (if OCR is multilingual)
+        urdu_match = re.search(r'(پارٹنر\s*نام|نام\s*خریدار)\s*[:\-]?\s*(.+)', text)
+        if urdu_match:
+            return urdu_match.group(2).strip()
 
         return None
+
+
 
     def get_items_for_matching(self):
         """Get all items with their names and codes for matching"""
@@ -1083,6 +1137,12 @@ def debug_ocr_preview(docname):
             img = Image.open(file_path)
             processed = preprocess_image(img)
             text = pytesseract.image_to_string(processed, config="--psm 4 --oem 3 -l eng+urd")
+
+            # ✅ ADD THIS BLOCK HERE:
+        with open("output.txt", "w") as f:
+            f.write(text)
+        import os
+        print("Saved OCR output to:", os.path.abspath("output.txt"))
 
         # Save to document for debugging
         doc.raw_ocr_text = text[:10000]
