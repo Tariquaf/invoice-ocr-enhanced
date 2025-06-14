@@ -10,6 +10,8 @@
   "source",
   "party",
   "reference",
+  "representative_name",
+  "representative",
   "create_invoice",
   "column_break_wauc",
   "file",
@@ -73,6 +75,19 @@
    "label": "Party",
    "options": "party_type",
    "insert_after": "reference"
+  },
+  {
+  "fieldname": "representative_name",
+  "fieldtype": "Data",
+  "label": "Representative Name",
+  "insert_after": "reference"
+  },
+  {
+  "fieldname": "representative",
+  "fieldtype": "Link",
+  "label": "Representative",
+  "options": "User",
+  "insert_after": "representative_name"
   },
   {
    "fieldname": "create_invoice",

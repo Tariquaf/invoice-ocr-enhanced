@@ -31,9 +31,18 @@ class InvoiceUpload(Document):
             frappe.throw(f"Invoice creation failed: {str(e)}")
 
     def before_save(self):
-        # Make submitted documents read-only
-        if self.docstatus == 1:
-            self.flags.read_only = True
+        try:
+            # Make submitted documents read-only
+            if self.docstatus == 1:
+                self.flags.read_only = True
+                
+            # AUTO-MATCH REPRESENTATIVE
+            if self.representative_name and not self.representative:
+                matched_user = self.fuzzy_match_representative(self.representative_name)
+                if matched_user:
+                    self.representative = matched_user
+        except Exception as e:
+            frappe.log_error(f"before_save failed: {str(e)}\n{traceback.format_exc()}", "Invoice Upload Error")
 
     def extract_invoice(self):
         try:
@@ -42,9 +51,12 @@ class InvoiceUpload(Document):
 
             start_time = time.time()
             file_path = get_file_path(self.file)
+            if not file_path:
+                frappe.throw(f"File path not found for: {self.file}")
+                
             text = ""
 
-                        # Enhanced Odoo-style preprocessing
+            # Enhanced Odoo-style preprocessing
             def preprocess_image(pil_img):
                 try:
                     img = np.array(pil_img.convert("RGB"))
@@ -106,6 +118,9 @@ class InvoiceUpload(Document):
             # Extract source and reference
             self.source = self.extract_source(text) or self.source
             self.reference = self.extract_reference(text) or self.reference
+            
+            # Extract representative
+            self.representative_name = self.extract_representative(text) or self.representative_name
             
             # Save immediately to capture metadata
             self.save()
@@ -191,165 +206,128 @@ class InvoiceUpload(Document):
             frappe.log_error(error_message, "OCR Extraction Failed")
             frappe.throw(f"Extraction failed: {str(e)}")
 
-    def ensure_party_exists(self):
-        extracted = json.loads(self.extracted_data or '{}')
-        party = extracted.get("party")
+    # ... (keep other methods unchanged until extract_representative)
 
-        if not party or not party.strip():
-            frappe.throw("Party is missing. Cannot create invoice.")
-        
-        # Check if party exists
-        if frappe.db.exists(self.party_type, party):
-            self.party = party
-            return
-            
-        # Try fuzzy matching again in case of close matches
-        party_match = self.fuzzy_match_party(party)
-        if party_match:
-            self.party = party_match["name"]
-            return
-
-        # If no match found, throw error
-        frappe.throw(f"Party '{party}' not found in the system. Please create it first.")
-
-    def create_invoice_from_child(self, submit_invoice=False):
-        """Create invoice, optionally submit it based on parameter"""
-        # Check if invoice already created
-        if self.invoice_created:
-            frappe.throw("Invoice already created for this document")
-            
-        # Ensure party is set and exists
-        # self.ensure_party_exists()
-
-        # Create the appropriate invoice type
-        if self.party_type == "Supplier":
-            inv = frappe.new_doc("Purchase Invoice")
-            inv.supplier = self.party
-        else:
-            inv = frappe.new_doc("Sales Invoice")
-            inv.customer = self.party
-
-        # ===== START: CHANGED SOURCE/REFERENCE MAPPING =====
-        # Handle Sales Invoice mapping
-        if self.party_type != "Supplier":  # Customer/Sales Invoice
-            inv.po_no = self.source or ""  # Source → Customer's Purchase Order
-            inv.remarks = self.reference or ""  # Reference → Remarks
-        else:  # Supplier/Purchase Invoice
-            inv.remarks = self.source or ""  # Source → Remarks
-            inv.bill_no = self.reference or self.name  # Reference → Bill No
-            inv.bill_date = self.invoice_date  # Invoice Date → Bill Date
-        # ===== END: CHANGED SOURCE/REFERENCE MAPPING =====
-
-        # Get appropriate account based on invoice type
-        if self.party_type == "Supplier":
-            account = self.get_expense_account()
-            account_field = "expense_account"
-        else:
-            account = self.get_income_account()
-            account_field = "income_account"
-
-        # Add items from the child table
-        items_added = 0
-        for row in self.invoice_upload_item:
-            item_code = row.item
-            if not item_code:
-                frappe.msgprint(f"Skipping item: {row.ocr_description} - no item matched", alert=True)
-                continue
-
-            try:
-                # Get item details
-                item_doc = frappe.get_doc("Item", item_code)
-                
-                # CONDITIONAL UOM SELECTION
-                if self.party_type == "Supplier":
-                    uom = item_doc.purchase_uom or item_doc.stock_uom or "Nos"
-                else:
-                    uom = item_doc.sales_uom or item_doc.stock_uom or "Nos"
-                
-                # Create item dictionary
-                item_dict = {
-                    "item_code": item_code,
-                    "item_name": item_doc.item_name,
-                    "description": item_doc.description or row.ocr_description,
-                    "qty": row.qty,
-                    "rate": row.rate,
-                    "uom": uom
-                }
-                
-                # Set account field based on invoice type
-                item_dict[account_field] = account
-                
-                inv.append("items", item_dict)
-                items_added += 1
-            except Exception as e:
-                frappe.msgprint(f"Error adding item {item_code}: {str(e)}", alert=True, indicator="red")
-
-        if items_added == 0:
-            frappe.throw("No valid items found to create invoice")
-
-        # SET DATES WITH OVERRIDE PRIORITY
-        posting_date = self.posting_date or self.invoice_date or nowdate()
-        due_date = self.due_date or add_days(posting_date, 30)
-        
-        # Set dates in invoice
-        inv.posting_date = posting_date
-        inv.due_date = due_date
-        
-        # For purchase invoices, set delivery date if available
-        if self.party_type == "Supplier" and self.delivery_date:
-            inv.set("delivery_date", self.delivery_date)
-        
-        # Calculate totals
-        inv.run_method("set_missing_values")
-        inv.run_method("calculate_taxes_and_totals")
-        
-        # Save invoice with appropriate validation
+    def extract_representative(self, text):
+        """Extract representative name from invoice (FIXED)"""
         try:
-            # Bypass validations for draft invoices
-            inv.flags.ignore_validate = True
-            inv.flags.ignore_mandatory = True
-            inv.insert(ignore_permissions=True)
-            status = "Draft"
+            # First, try to find the representative using explicit patterns
+            patterns = [
+                r'Sales\s*Person\s*[:\-]?\s*([^\n\d]+)',
+                r'Purchase\s*Representative\s*[:\-]?\s*([^\n\d]+)',
+                r'Representative\s*[:\-]?\s*([^\n\d]+)',
+                r'Prepared\s*by\s*[:\-]?\s*([^\n\d]+)',
+                r'Attn\s*[:\-]?\s*([^\n\d]+)',
+                r'ATTN\s*[:\-]?\s*([^\n\d]+)',
+                r'Seller\s*[:\-]?\s*([^\n\d]+)',
+                r'Purchaser\s*[:\-]?\s*([^\n\d]+)'
+            ]
+            
+            for pattern in patterns:
+                match = re.search(pattern, text, re.IGNORECASE)
+                if match:
+                    name = match.group(1).strip()
+                    # Clean name and remove any trailing numbers/dates
+                    name = re.sub(r'\s+\d+.*$', '', name)  # Remove trailing numbers
+                    name = re.sub(r'[^\w\s\.-]', '', name).strip()
+                    if name and len(name) > 3:
+                        return name
+            
+            # If explicit patterns fail, look for name after "Purchase Representative"
+            rep_match = re.search(r'Purchase Representative[^\n]*\n([^\n]+)', text, re.IGNORECASE)
+            if rep_match:
+                name = rep_match.group(1).strip()
+                # Clean name and remove any trailing numbers/dates
+                name = re.sub(r'\s+\d+.*$', '', name)  # Remove trailing numbers
+                name = re.sub(r'[^\w\s\.-]', '', name).strip()
+                if name and len(name) > 3:
+                    return name
+                    
+            return None
         except Exception as e:
-            frappe.msgprint(f"Invoice creation failed: {str(e)}", alert=True, indicator="red")
-            frappe.log_error(f"Invoice creation failed: {str(e)}", "Invoice Creation Error")
-            return
+            frappe.log_error(f"extract_representative failed: {str(e)}\n{traceback.format_exc()}", "Representative Extraction Error")
+            return None
+
+    def extract_source(self, text):
+        """Extract source (PO/SO number) with enhanced pattern matching (FIXED)"""
+        try:
+            # 1. First look for Request for Quotation pattern
+            rfq_match = re.search(r'Request\s*for\s*Quotation\s*[#:]*\s*([A-Z0-9-]+)', text, re.IGNORECASE)
+            if rfq_match:
+                return rfq_match.group(1).strip()
+            
+            # 2. Look for PO/SO patterns
+            po_patterns = [
+                r'\b(?:PO|SO)[\s-]*([A-Z0-9-]{8,})',  # Minimum 8 chars
+                r'\b(?:Purchase|Sales)[\s-]*Order[\s-]*([A-Z0-9-]+)',
+                r'Order[\s-]*Number[\s-]*:\s*([A-Z0-9-]+)',
+                r'^[\s]*([A-Z]{2,}\d{4,}[-]?\d*)\s*$'  # Standalone PO pattern
+            ]
+            
+            for pattern in po_patterns:
+                match = re.search(pattern, text, re.IGNORECASE)
+                if match:
+                    po_value = match.group(1).strip()
+                    if len(po_value) > 5:  # Minimum length for PO
+                        return po_value
+            
+            # 3. Table-based extraction as fallback
+            lines = text.splitlines()
+            order_keywords = [
+                "Source", "PO", "SO", "Order", "Book",
+                "Purchase Order", "Sales Order", "P.O.", "S.O.", "Request for Quotation"
+            ]
+            
+            for i, line in enumerate(lines):
+                if any(keyword in line for keyword in order_keywords):
+                    if i + 1 < len(lines):
+                        value_line = lines[i + 1]
+                        
+                        if '|' in value_line:
+                            parts = [p.strip() for p in value_line.split('|') if p.strip()]
+                        else:
+                            parts = re.split(r'\s{2,}', value_line)
+                        
+                        if parts:
+                            # Find the most PO-like value
+                            for part in parts:
+                                if re.match(r'[A-Z]{2,}[-]?[A-Z0-9-]{6,}', part):
+                                    return part.strip()
+            
+            return None
+        except Exception as e:
+            frappe.log_error(f"extract_source failed: {str(e)}\n{traceback.format_exc()}", "Source Extraction Error")
+            return None
+
+    def fuzzy_match_representative(self, name):
+        """Fuzzy match representative name to users"""
+        if not name:
+            return None
+            
+        clean_name = name.lower().strip()
+        users = frappe.get_all("User", 
+                              fields=["name", "full_name"],
+                              filters={"enabled": 1})
         
-        # Update status and reference
-        frappe.db.set_value(self.doctype, self.name, {
-            "invoice_created": 1,
-            "invoice_reference": inv.name,
-            "invoice_type": inv.doctype,
-            "invoice_status": status
-        })
-
-        frappe.msgprint(f"<a href='{get_url_to_form(inv.doctype, inv.name)}'>{inv.name}</a> created ({status})")
-
-    def get_expense_account(self):
-        company = frappe.defaults.get_user_default("Company")
-        account = frappe.db.get_value("Company", company, "default_expense_account")
-        if not account:
-            account = frappe.db.get_value("Account", {
-                "account_type": "Expense",
-                "company": company,
-                "is_group": 0
-            }, "name")
-        if not account:
-            frappe.throw("No default Expense Account found for the company.")
-        return account
-
-    def get_income_account(self):
-        company = frappe.defaults.get_user_default("Company")
-        account = frappe.db.get_value("Company", company, "default_income_account")
-        if not account:
-            account = frappe.db.get_value("Account", {
-                "account_type": "Income",
-                "company": company,
-                "is_group": 0
-            }, "name")
-        if not account:
-            frappe.throw("No default Income Account found for the company.")
-        return account
+        best_match = None
+        best_score = 0
+        
+        for user in users:
+            # Try both full name and username
+            for field in ["full_name", "name"]:
+                if not user.get(field):
+                    continue
+                    
+                score = difflib.SequenceMatcher(
+                    None, clean_name, user[field].lower()
+                ).ratio() * 100
+                
+                if score > best_score:
+                    best_score = score
+                    best_match = user["name"]
+        
+        # Only return if good match
+        return best_match if best_score > 75 else None
 
     def extract_items(self, text):
         # First try to extract as structured table items
@@ -607,7 +585,7 @@ class InvoiceUpload(Document):
             return None
 
     def extract_source(self, text):
-        """Extract source (PO/SO number) with enhanced pattern matching"""
+        """Extract source (PO/SO number) with enhanced pattern matching (FIXED)"""
         # 1. Table-based extraction - flexible header detection
         lines = text.splitlines()
         source_value = None
@@ -621,9 +599,7 @@ class InvoiceUpload(Document):
         # Find relevant header line
         for i, line in enumerate(lines):
             # Check if any order keyword exists in line
-            if any(keyword in line for keyword in order_keywords) and (
-                "Invoice Date" in line or "Date" in line
-            ):
+            if any(keyword in line for keyword in order_keywords):
                 # Next line should contain values
                 if i + 1 < len(lines):
                     value_line = lines[i + 1]
@@ -664,6 +640,8 @@ class InvoiceUpload(Document):
         
         # 2. Enhanced label-based extraction
         label_patterns = [
+            # Fixed pattern for "Request for Quotation"
+            r'Request\s*for\s*Quotation\s*[#:]*\s*([A-Za-z0-9\s-]+)',
             r'(?:Purchase Order|Sales Order|PO|SO|Source|Order)[\s#:]*([A-Za-z0-9\s-]+)',
             r'(?:P\.O\.|S\.O\.)[\s#:]*([A-Za-z0-9\s-]+)',
             r'Book[\s-]*(\d+)'
@@ -677,20 +655,30 @@ class InvoiceUpload(Document):
                     # For book patterns, reconstruct full reference
                     if "Book" in pattern:
                         return f"Credit Book-{source_value}"
-                    return source_value
+                    
+                    # Clean the extracted value
+                    source_value = re.sub(r'(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|\d+:\d+|\d+\.\d+|\d+$)', '', source_value)
+                    source_value = re.sub(r'[^\w\s-]', '', source_value).strip()
+                    
+                    if source_value:
+                        return source_value
         
         # 3. Standalone order number patterns
         order_patterns = [
-            r'\b(?:PO|SO)[\s-]*(\w{2,}\d{3,})',
-            r'\b(?:Purchase|Sales)[\s-]*Order[\s-]*(\w{2,}\d{3,})',
-            r'Order[\s-]*Number[\s-]*:\s*(\w{2,}\d{3,})',
-            r'^[\s]*([A-Z]{2,}\d{4,})\s*$'
+            r'\b(?:PO|SO)[\s-]*([A-Za-z0-9-]+)',  # Fixed to capture full PO numbers
+            r'\b(?:Purchase|Sales)[\s-]*Order[\s-]*([A-Za-z0-9-]+)',
+            r'Order[\s-]*Number[\s-]*:\s*([A-Za-z0-9-]+)',
+            r'^[\s]*([A-Za-z0-9-]{8,})\s*$'  # Minimum 8 characters to avoid false positives
         ]
         
         for pattern in order_patterns:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
-                return match.group(1).strip()
+                source_value = match.group(1).strip()
+                # Clean the extracted value
+                source_value = re.sub(r'[^\w\s-]', '', source_value).strip()
+                if source_value and len(source_value) > 5:  # Minimum length for PO
+                    return source_value
         
         return None
 
