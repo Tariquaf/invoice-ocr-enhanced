@@ -7,9 +7,11 @@
  "engine": "InnoDB",
  "field_order": [
   "ocr_description",
+  "ocr_uom",
   "item",
   "qty",
-  "rate"
+  "rate",
+  "uom"
  ],
  "fields": [
   {
@@ -46,13 +48,27 @@
    "in_standard_filter": 1,
    "label": "Quantity",
    "precision": "2"
+  },
+  {
+   "fieldname": "ocr_uom",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "in_preview": 1,
+   "in_standard_filter": 1,
+   "label": "OCR UOM"
+  },
+  {
+   "fieldname": "uom",
+   "fieldtype": "Link",
+   "label": "UOM",
+   "options": "UOM"
   }
  ],
  "grid_page_length": 50,
  "index_web_pages_for_search": 1,
  "istable": 1,
  "links": [],
- "modified": "2025-06-12 18:58:33.478130",
+ "modified": "2025-06-14 22:13:26.319784",
  "modified_by": "Administrator",
  "module": "Invoice Ocr",
  "name": "Invoice Upload Item",
