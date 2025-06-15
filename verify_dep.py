@@ -22,7 +22,7 @@ def check_package(package_name):
         return False, "Not installed"
 
 # Check Python packages
-packages = ["cv2", "pytesseract", "numpy", "PyPDF2", "pdf2image", "PIL"]
+packages = ["opencv-python", "pytesseract", "numpy", "PyPDF2", "pdf2image", "PIL"]
 print("Python version:", sys.version)
 print("\nChecking Python packages:")
 for pkg in packages:
