@@ -7,11 +7,5 @@ python-Levenshtein
 easyocr
 opencv-python
 numpy
-frappe
-re
-base64
-io
-traceback
 requests
-uuid
-os
+frappe
