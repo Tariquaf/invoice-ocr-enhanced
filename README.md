@@ -44,7 +44,7 @@ Install required system packages:
 sudo apt update
 sudo apt install tesseract-ocr libtesseract-dev tesseract-ocr-eng tesseract-ocr-urd
 sudo apt install poppler-utils  # For PDF processing
-sudo apt install libgl1-mesa-glx  # For OpenCV
+sudo apt install libgl1-mesa-glx  # For OpenCV according to your distribution
 
 # Get the app from GitHub
 
