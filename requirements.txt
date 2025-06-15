@@ -7,7 +7,6 @@ fuzzywuzzy
 python-Levenshtein
 easyocr
 opencv-python
-cv2
 numpy
 frappe
 json
