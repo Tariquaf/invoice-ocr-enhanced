@@ -1,7 +1,7 @@
 [project]
 name = "invoice_ocr"
 authors = [
-    { name = "mohtashim", email = "shoaibmohtashim973@gmail.com"}
+    { name = "Tariq Mushtaq", email = "mail@agrovisions.com"}
 ]
 description = "invoice ocr"
 requires-python = ">=3.10"

@@ -1,6 +1,8 @@
 # 📄 Invoice OCR (Enhanced) App for ERPNext v15 
 
-This repository offers a significantly improved version of the Invoice OCR tool, originally created by [Mohtashim-1](https://github.com/Mohtashim-1/Invoice-OCR). It automates data extraction from scanned PDF or image invoices and creates Sales or Purchase Invoices in ERPNext using OCR.
+This repository offers a significantly improved version of the Invoice OCR tool, originally created by [Mohtashim-1](https://github.com/Mohtashim-1/Invoice-OCR). It automates data extraction from scanned PDF or image invoices and creates Sales or Purchase Invoices in ERPNext using OCR. This module was optimised for Odoo default Vendor Bills and Customer Invoices especially if you want to migrate from Odoo to ERPNext and wants to keep all sales/purchase data. Even if your vendor and/or your customer is using Odoo, you can scan bills and invoices.
+
+I shall be adding more format of invoices in future if required so. Contributions are welcomed. 
 
 ## 🚀 What's New in This Fork
 
