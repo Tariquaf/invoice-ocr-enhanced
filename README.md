@@ -56,7 +56,7 @@ source ~/frappe-bench/env/bin/activate
 
 # Install required Python libraries
 
-pip install -r apps/invoice_ocr/requirements.txt
+pip install -r ~/frappe-bench/apps/invoice_ocr/requirements.txt
 
 # Or manually install requirements
 
