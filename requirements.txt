@@ -8,6 +8,7 @@ python-Levenshtein
 easyocr
 opencv-python
 numpy
+numpy
 frappe
 json
 re
