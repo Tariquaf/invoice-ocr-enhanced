@@ -1,11 +1,24 @@
+# OCR and Image Processing
 pytesseract
 pdf2image
 Pillow
 PyPDF2
-fuzzywuzzy
-python-Levenshtein
 easyocr
+
+# OpenCV and numerical computing
 opencv-python
 numpy
+
+# String similarity
+fuzzywuzzy
+python-Levenshtein
+
+# Web and I/O
 requests
 frappe
+
+# Torch CPU-only version (don't let it install CUDA packages)
+torch==2.3.0+cpu
+torchvision==0.18.0+cpu
+torchaudio==2.3.0+cpu
+-f https://download.pytorch.org/whl/cpu/torch_stable.html
