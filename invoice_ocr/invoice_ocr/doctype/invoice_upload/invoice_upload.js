@@ -8,6 +8,7 @@ frappe.ui.form.on('Invoice Upload', {
             args: { name: frm.doc.name },
             callback: function (r) {
                 if (r.message) {
+                    frappe.model.sync(r.message);
                     frappe.set_route("Form", r.message.doctype, r.message.name);
                 }
             }
@@ -22,8 +23,12 @@ frappe.ui.form.on("Invoice Upload", {
         frappe.call({
         method: "invoice_ocr.invoice_ocr.doctype.invoice_upload.invoice_upload.extract_invoice",
         args: { docname: frm.doc.name },
-        callback: function () {
-            frm.reload_doc();
+        callback: function (r) {
+          if (r.message) {
+            frappe.model.sync(r.message);
+            frappe.set_route("Form", r.message.doctype, r.message.name);
+          }
+          frm.reload_doc();
         }
         });
       });
