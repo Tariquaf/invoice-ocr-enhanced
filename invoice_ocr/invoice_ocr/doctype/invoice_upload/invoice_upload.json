@@ -12,7 +12,6 @@
   "reference",
   "representative_name",
   "representative",
-  "create_invoice",
   "column_break_wauc",
   "file",
   "ocr_status",
@@ -81,11 +80,6 @@
    "options": "User"
   },
   {
-   "fieldname": "create_invoice",
-   "fieldtype": "Button",
-   "label": "Create Invoice"
-  },
-  {
    "fieldname": "column_break_wauc",
    "fieldtype": "Column Break"
   },
@@ -140,7 +134,7 @@
  "index_web_pages_for_search": 1,
  "is_submittable": 1,
  "links": [],
- "modified": "2025-06-15 04:27:18.868058",
+ "modified": "2025-06-19 14:17:43.996592",
  "modified_by": "Administrator",
  "module": "Invoice Ocr",
  "name": "Invoice Upload",
