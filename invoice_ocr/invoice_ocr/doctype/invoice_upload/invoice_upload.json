@@ -1,162 +1,208 @@
 {
- "actions": [],
- "allow_rename": 1,
- "autoname": "format:IU-{YY}-{MM}-{###}",
- "creation": "2025-05-24 00:30:47.121979",
- "doctype": "DocType",
- "engine": "InnoDB",
- "field_order": [
-  "party_type",
-  "source",
-  "party",
-  "reference",
-  "representative_name",
-  "representative",
-  "column_break_wauc",
-  "file",
-  "ocr_status",
-  "invoice_date",
-  "due_date",
-  "delivery_date",
-  "posting_date",
-  "amended_from",
-  "extracted_data_section",
-  "extracted_data",
-  "invoice_item_section",
-  "invoice_upload_item"
- ],
- "fields": [
-  {
-   "fieldname": "party_type",
-   "fieldtype": "Select",
-   "label": "Party Type",
-   "options": "Customer\nSupplier"
-  },
-  {
-   "fieldname": "invoice_date",
-   "fieldtype": "Date",
-   "label": "Invoice Date"
-  },
-  {
-   "fieldname": "due_date",
-   "fieldtype": "Date",
-   "label": "Due Date"
-  },
-  {
-   "fieldname": "delivery_date",
-   "fieldtype": "Date",
-   "label": "Delivery Date"
-  },
-  {
-   "fieldname": "posting_date",
-   "fieldtype": "Date",
-   "label": "Posting Date"
-  },
-  {
-   "fieldname": "source",
-   "fieldtype": "Data",
-   "label": "Source (PO/SO Number)"
-  },
-  {
-   "fieldname": "reference",
-   "fieldtype": "Data",
-   "label": "Reference Number"
-  },
-  {
-   "fieldname": "party",
-   "fieldtype": "Dynamic Link",
-   "label": "Party",
-   "options": "party_type"
-  },
-  {
-   "fieldname": "representative_name",
-   "fieldtype": "Data",
-   "label": "Representative Name"
-  },
-  {
-   "fieldname": "representative",
-   "fieldtype": "Link",
-   "label": "Representative",
-   "options": "User"
-  },
-  {
-   "fieldname": "column_break_wauc",
-   "fieldtype": "Column Break"
-  },
-  {
-   "allow_on_submit": 1,
-   "fieldname": "ocr_status",
-   "fieldtype": "Select",
-   "label": "OCR Status",
-   "options": "Pending\nProcessing\nExtracted\nFailed",
-   "read_only": 1
-  },
-  {
-   "allow_on_submit": 1,
-   "fieldname": "file",
-   "fieldtype": "Attach",
-   "label": "Upload File"
-  },
-  {
-   "fieldname": "amended_from",
-   "fieldtype": "Link",
-   "label": "Amended From",
-   "no_copy": 1,
-   "options": "Invoice Upload",
-   "print_hide": 1,
-   "read_only": 1,
-   "search_index": 1
-  },
-  {
-   "collapsible": 1,
-   "fieldname": "extracted_data_section",
-   "fieldtype": "Section Break",
-   "label": "Extracted Data"
-  },
-  {
-   "allow_on_submit": 1,
-   "fieldname": "extracted_data",
-   "fieldtype": "Code",
-   "label": "Extracted JSON"
-  },
-  {
-   "fieldname": "invoice_item_section",
-   "fieldtype": "Section Break",
-   "label": "Invoice Item"
-  },
-  {
-   "fieldname": "invoice_upload_item",
-   "fieldtype": "Table",
-   "label": "Invoice Upload Item",
-   "options": "Invoice Upload Item"
-  }
- ],
- "index_web_pages_for_search": 1,
- "is_submittable": 1,
- "links": [],
- "modified": "2025-06-19 14:17:43.996592",
- "modified_by": "Administrator",
- "module": "Invoice Ocr",
- "name": "Invoice Upload",
- "naming_rule": "Expression",
- "owner": "Administrator",
- "permissions": [
-  {
-   "create": 1,
-   "delete": 1,
-   "email": 1,
-   "export": 1,
-   "print": 1,
-   "read": 1,
-   "report": 1,
-   "role": "System Manager",
-   "share": 1,
-   "write": 1
-  }
- ],
- "row_format": "Dynamic",
- "sort_field": "modified",
- "sort_order": "DESC",
- "states": [],
- "track_changes": 1
+  "actions": [],
+  "allow_rename": 1,
+  "autoname": "format:IU-{YY}-{MM}-{###}",
+  "creation": "2025-05-24 00:30:47.121979",
+  "doctype": "DocType",
+  "engine": "InnoDB",
+  "field_order": [
+    "party_type",
+    "source",
+    "party",
+    "reference",
+    "representative_name",
+    "representative",
+    "create_invoice",
+    "column_break_wauc",
+    "file",
+    "ocr_status",
+    "invoice_created",
+    "invoice_reference",
+    "invoice_type",
+    "invoice_status",
+    "invoice_date",
+    "due_date",
+    "delivery_date",
+    "posting_date",
+    "amended_from",
+    "extracted_data_section",
+    "extracted_data",
+    "invoice_item_section",
+    "invoice_upload_item"
+  ],
+  "fields": [
+    {
+      "fieldname": "party_type",
+      "fieldtype": "Select",
+      "label": "Party Type",
+      "options": "Customer\nSupplier"
+    },
+    {
+      "fieldname": "invoice_date",
+      "fieldtype": "Date",
+      "label": "Invoice Date"
+    },
+    {
+      "fieldname": "due_date",
+      "fieldtype": "Date",
+      "label": "Due Date"
+    },
+    {
+      "fieldname": "delivery_date",
+      "fieldtype": "Date",
+      "label": "Delivery Date"
+    },
+    {
+      "fieldname": "posting_date",
+      "fieldtype": "Date",
+      "label": "Posting Date"
+    },
+    {
+      "fieldname": "source",
+      "fieldtype": "Data",
+      "label": "Source (PO/SO Number)"
+    },
+    {
+      "fieldname": "reference",
+      "fieldtype": "Data",
+      "label": "Reference Number"
+    },
+    {
+      "fieldname": "party",
+      "fieldtype": "Dynamic Link",
+      "label": "Party",
+      "options": "party_type"
+    },
+    {
+      "fieldname": "representative_name",
+      "fieldtype": "Data",
+      "label": "Representative Name"
+    },
+    {
+      "fieldname": "representative",
+      "fieldtype": "Link",
+      "label": "Representative",
+      "options": "User"
+    },
+    {
+      "fieldname": "create_invoice",
+      "fieldtype": "Button",
+      "label": "Create Invoice"
+    },
+    {
+      "fieldname": "column_break_wauc",
+      "fieldtype": "Column Break"
+    },
+    {
+      "allow_on_submit": 1,
+      "fieldname": "ocr_status",
+      "fieldtype": "Select",
+      "label": "OCR Status",
+      "options": "Pending\nProcessing\nExtracted\nFailed",
+      "read_only": 1
+    },
+    {
+      "fieldname": "invoice_created",
+      "fieldtype": "Check",
+      "label": "Invoice Created",
+      "default": 0,
+      "insert_after": "ocr_status",
+      "allow_on_submit": 1,
+      "read_only": 1
+    },
+    {
+      "fieldname": "invoice_reference",
+      "fieldtype": "Data",
+      "label": "Invoice Reference",
+      "insert_after": "invoice_created",
+      "allow_on_submit": 1,
+      "read_only": 1
+    },
+    {
+      "fieldname": "invoice_type",
+      "fieldtype": "Data",
+      "label": "Invoice Type",
+      "insert_after": "invoice_reference",
+      "allow_on_submit": 1,
+      "read_only": 1
+    },
+    {
+      "fieldname": "invoice_status",
+      "fieldtype": "Data",
+      "label": "Invoice Status",
+      "insert_after": "invoice_type",
+      "allow_on_submit": 1,
+      "read_only": 1
+    },
+    {
+      "allow_on_submit": 1,
+      "fieldname": "file",
+      "fieldtype": "Attach",
+      "label": "Upload File"
+    },
+    {
+      "fieldname": "amended_from",
+      "fieldtype": "Link",
+      "label": "Amended From",
+      "no_copy": 1,
+      "options": "Invoice Upload",
+      "print_hide": 1,
+      "read_only": 1,
+      "search_index": 1
+    },
+    {
+      "collapsible": 1,
+      "fieldname": "extracted_data_section",
+      "fieldtype": "Section Break",
+      "label": "Extracted Data"
+    },
+    {
+      "allow_on_submit": 1,
+      "fieldname": "extracted_data",
+      "fieldtype": "Code",
+      "label": "Extracted JSON"
+    },
+    {
+      "fieldname": "invoice_item_section",
+      "fieldtype": "Section Break",
+      "label": "Invoice Item"
+    },
+    {
+      "fieldname": "invoice_upload_item",
+      "fieldtype": "Table",
+      "label": "Invoice Upload Item",
+      "options": "Invoice Upload Item"
+    }
+  ],
+  "index_web_pages_for_search": 1,
+  "is_submittable": 1,
+  "links": [],
+  "modified": "2025-06-15 04:27:18.868058",
+  "modified_by": "Administrator",
+  "module": "Invoice Ocr",
+  "name": "Invoice Upload",
+  "naming_rule": "Expression",
+  "owner": "Administrator",
+  "permissions": [
+    {
+      "role": "System Manager",
+      "create": 1,
+      "delete": 1,
+      "email": 1,
+      "export": 1,
+      "print": 1,
+      "read": 1,
+      "report": 1,
+      "share": 1,
+      "write": 1,
+      "submit": 1,
+      "cancel": 1,
+      "amend": 1
+    }
+  ],
+  "row_format": "Dynamic",
+  "sort_field": "modified",
+  "sort_order": "DESC",
+  "states": [],
+  "track_changes": 1
 }
