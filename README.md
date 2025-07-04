@@ -36,9 +36,9 @@ The script defines a Frappe DocType `InvoiceUpload` that:
 
 ## ⚙️ Full Installation Guide & How to Use
 
-### ✅ 1. Prerequisites
+### ✅ Prerequisites
 
-Install required system packages:
+#### Install required system packages:
 
 ```bash
 sudo apt update
@@ -46,17 +46,17 @@ sudo apt install tesseract-ocr libtesseract-dev tesseract-ocr-eng tesseract-ocr-
 sudo apt install poppler-utils  # For PDF processing
 sudo apt install libgl1-mesa-glx  # For OpenCV according to your distribution
 ```
-## Get the app from GitHub
+#### Get the app from GitHub
 
 ```bash
 bench get-app https://github.com/Tariquaf/invoice-ocr-enhanced.git
 ```
-## Activate your Frappe virtual environment
+#### Activate your Frappe virtual environment
 
 ```bash
 source ~/frappe-bench/env/bin/activate
 ```
-## Install required Python libraries
+#### Install required Python libraries
 
 ```bash
 pip install -r ~/frappe-bench/apps/invoice_ocr/requirements.txt
@@ -65,17 +65,17 @@ pip install -r ~/frappe-bench/apps/invoice_ocr/requirements.txt
 
 pip install opencv-python-headless pytesseract numpy PyPDF2 pdf2image Pillow requests
 ```
-## Verify dependencies
+#### Verify dependencies
 
 ```bash
 python3 ~/frappe-bench/apps/invoice_ocr/verify_dep.py
 ```
-## Deactivate virtual enviroment
+#### Deactivate virtual enviroment
 
 ```bash
 deactivate
 ```
-## 4. Install the app on your site
+#### Install the app on your site
 
 ```bash
 cd ~/frappe-bench
@@ -83,11 +83,11 @@ cd ~/frappe-bench
 ```bash
 bench --site yoursite.com install-app invoice_ocr
 ```
-## Apply necessary migrations
+#### Apply necessary migrations
 ```bash
 bench migrate
 ```
-## Restart bench or supervisor
+#### Restart bench or supervisor
 ```bash
 bench restart #for production
 bench start #for development
