@@ -15,6 +15,108 @@ from PIL import Image
 from frappe.utils import add_days, get_url_to_form, nowdate
 import time
 
+# Dynamic vertical table header flattening & lookup keywords
+HEADER_FIELD_KEYWORDS = {
+    "description": ["DESCRIPTION","PARTICULARS","ITEM","PRODUCT","GOODS","MATERIAL","وصف","البند","الصنف"],
+    "uom":         ["UNIT","UOM","MEASURE","UNIT OF MEASURE","وحدة","الوحدة","مقياس"],
+    "quantity":    ["NO","QTY","QUANTITY","COUNT","العدد","مقدار"],
+    "price":       ["UNIT PRICE","PRICE","RATE","COST","UNIT COST","السعر","معدل","التكلفة"],
+    "amount":      ["TOTAL","AMOUNT","LINE TOTAL","VALUE","المبلغ","القيمة","الإجمالي"]
+}
+N = len(HEADER_FIELD_KEYWORDS)
+
+def flatten_vertical_table_dynamic(text):
+    """
+    Collapse N-line vertical tables into a single-line header plus one line per row,
+    using HEADER_FIELD_KEYWORDS to detect each column in any order.
+    """
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    flat = []
+    i = 0
+
+    while i + N <= len(lines):
+        block = lines[i : i + N]
+        mapping = {}
+        # match each block line to a header field
+        for idx, line in enumerate(block):
+            upper = line.upper()
+            for field, kws in HEADER_FIELD_KEYWORDS.items():
+                if field in mapping:
+                    continue
+                if any(key in upper for key in kws):
+                    mapping[field] = idx
+                    break
+
+        # if all headers found in this block, collapse header and rows
+        if set(mapping.keys()) == set(HEADER_FIELD_KEYWORDS.keys()):
+            # build header line
+            header_line = "  ".join(block[mapping[f]] for f in HEADER_FIELD_KEYWORDS)
+            flat.append(header_line)
+            i += N
+
+            # collapse subsequent N-line rows until TOTAL encountered
+            while i + N <= len(lines):
+                row = lines[i : i + N]
+                desc = row[mapping["description"]].strip().upper()
+                if desc in ("TOTAL", "GRAND TOTAL"):
+                    break
+                row_line = "  ".join(row[mapping[f]] for f in HEADER_FIELD_KEYWORDS)
+                flat.append(row_line)
+                i += N
+
+            continue
+
+        # not a vertical table header, copy line as-is
+        flat.append(lines[i])
+        i += 1
+
+    # append any trailing lines
+    flat.extend(lines[i:])
+    return "\n".join(flat)
+
+
+def extract_pdf_text(file_path, min_chars=100):
+    """
+    Try to pull embedded text from the first 3 pages of a PDF.
+    Return text if it’s at least `min_chars` long; otherwise None.
+    """
+    try:
+        reader = PdfReader(file_path)
+        text = ""
+        for page in reader.pages[:3]:
+            text += (page.extract_text() or "") + "\n"
+        return text if len(text) >= min_chars else None
+    except Exception:
+        return None
+
+import re
+
+def extract_items_section(text):
+    """
+    Return only the lines from the first description-synonym header
+    through the final amount-synonym line (inclusive).
+    """
+    lines = text.splitlines()
+
+    # find start line (any description keyword)
+    start = None
+    for i, line in enumerate(lines):
+        if any(kw in line.upper() for kw in HEADER_FIELD_KEYWORDS["description"]):
+            start = i
+            break
+    if start is None:
+        return text
+
+    # find end line (any amount keyword at start)
+    end = None
+    for i, line in enumerate(lines[start+1:], start+1):
+        if any(line.upper().startswith(kw) for kw in HEADER_FIELD_KEYWORDS["amount"]):
+            end = i + 1
+            break
+    end = end or len(lines)
+
+    return "\n".join(lines[start:end])
+
 
 class InvoiceUpload(Document):
    
@@ -104,9 +206,24 @@ class InvoiceUpload(Document):
                     page_text = pytesseract.image_to_string(processed, config=ocr_config)
                     text += page_text
                     img.close()  # Free memory immediately
+            if file_path.endswith(".pdf"):
+                # 1) Try embedded text first
+                pdf_text = extract_pdf_text(file_path)
+                if pdf_text:
+                    text = pdf_text
+                else:
+                # 2) Fallback to OCR on pages 1–3
+                    start_time = time.time()
+                    text = ""
+                    images = convert_from_path(file_path, dpi=200, first_page=1, last_page=3)
+                    for img in images:
+                        if time.time() - start_time > 120:
+                            frappe.throw("OCR processing timed out. Try with smaller file or fewer pages.")
+                        processed = preprocess_image(img)
+                        text += pytesseract.image_to_string(processed, config=ocr_config)
+                        img.close()
+            
             else:
-                import cv2
-                import numpy as np
                 img = Image.open(file_path)
                 try:
                     # Convert PIL image to OpenCV format
@@ -116,7 +233,9 @@ class InvoiceUpload(Document):
                     gray = cv2.cvtColor(image_cv, cv2.COLOR_BGR2GRAY)
 
                     # Thresholding to improve OCR accuracy
-                    _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                    _, thresh = cv2.threshold(
+                        gray, 150, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+                    )
 
                     # Convert back to PIL for pytesseract
                     processed_img = Image.fromarray(thresh)
@@ -126,9 +245,20 @@ class InvoiceUpload(Document):
                 finally:
                     img.close()
                     
-            # Save extracted text for debugging
-            self.raw_ocr_text = text[:10000]  # Save first 10k characters
-            
+            # Normalize vertical tables and save OCR text
+            text = flatten_vertical_table_dynamic(text)
+            self.raw_ocr_text = text[:10000]
+
+            # Carve out just the item-table section (and debug‐dump it)
+            table_text = extract_items_section(text)
+            with open("/tmp/DEBUG_table.txt", "w") as f:
+                f.write(table_text)
+
+            # Try structured table extraction, else charges or fallback
+            items = self.extract_table_items(table_text)
+            if not items:
+                items = self.extract_charges(text) or self.extract_items_fallback(text)
+
             # ===== EXTRACT METADATA =====
             # Extract dates
             dates = self.extract_dates(text)
@@ -145,10 +275,19 @@ class InvoiceUpload(Document):
             self.representative_name = self.extract_representative(text) or self.representative_name
             
             # Save immediately to capture metadata
+            # … after metadata extraction …
             self.save()
-            # ===== END METADATA EXTRACTION =====
-            
-            items = self.extract_items(text)
+
+            # 1) carve out just the item‐table section
+            table_text = extract_items_section(text)
+
+            # 2) parse only that chunk
+            items = self.extract_table_items(table_text)
+
+            # 3) if no structured rows found, fall back
+            if not items:
+                items = self.extract_charges(text) or self.extract_items_fallback(text)
+
             extracted_data = {
                 "items": items,
                 "party": None
@@ -601,108 +740,6 @@ class InvoiceUpload(Document):
         
         return items
 
-    def extract_table_items(self, text):
-        """Extract items from structured tables with UOM support"""
-        items = []
-        lines = text.splitlines()
-        
-        # Find the start of the items table
-        start_index = -1
-        header_patterns = [
-            r"DESCRIPTION.*QUANTITY.*UOM.*UNIT PRICE.*AMOUNT",
-            r"PARTICULARS.*QUANTITY.*UOM.*RATE.*AMOUNT",
-            r"ITEM.*QTY.*UOM.*PRICE.*TOTAL",
-            r"DESCRIPTION.*QUANTITY.*UNIT PRICE.*AMOUNT",
-            r"PARTICULARS.*QUANTITY.*RATE.*AMOUNT",
-            r"ITEM.*QTY.*PRICE.*TOTAL"
-        ]
-        
-        header_parts = None
-        uom_col_index = None
-        
-        for i, line in enumerate(lines):
-            for pattern in header_patterns:
-                if re.search(pattern, line, re.IGNORECASE):
-                    start_index = i + 1
-                    # Split header to find UOM column
-                    if '|' in line:
-                        header_parts = [part.strip() for part in line.split('|')]
-                    else:
-                        header_parts = re.split(r'\s{2,}', line)
-                    
-                    # Find UOM column index
-                    for idx, part in enumerate(header_parts):
-                        if "UOM" in part.upper():
-                            uom_col_index = idx
-                            break
-                    break
-            if start_index != -1:
-                break
-        
-        # If table header found, process subsequent lines
-        if start_index != -1:
-            for i in range(start_index, min(start_index + 20, len(lines))):
-                line = lines[i]
-                if not line.strip() or "---" in line or "===" in line:
-                    break
-                
-                # Split line by pipe character or multiple spaces
-                if '|' in line:
-                    parts = [part.strip() for part in line.split('|')]
-                else:
-                    parts = re.split(r'\s{2,}', line)
-                
-                if len(parts) < 4:
-                    continue
-                
-                try:
-                    # Skip lines that are clearly not items
-                    if "Total" in parts[0] or "Subtotal" in parts[0] or "Grand" in parts[0]:
-                        continue
-                    
-                    # Combine description parts
-                    description = " ".join(parts[:-3]).strip()
-                    
-                    # Last three parts should be Qty, Rate, Amount
-                    qty_str = parts[-3].replace(',', '')
-                    rate_str = parts[-2].replace(',', '')
-                    
-                    # Extract quantity number
-                    qty_match = re.search(r'(\d+\.\d{3}|\d+)', qty_str)
-                    if not qty_match:
-                        continue
-                    qty = float(qty_match.group(1))
-                    
-                    # Extract rate number
-                    rate_match = re.search(r'(\d+\.\d{2,3}|\d+)', rate_str)
-                    if not rate_match:
-                        continue
-                    rate = float(rate_match.group(1))
-                    
-                    # Clean up description
-                    description = re.sub(r'\.{3,}', '', description)
-                    description = re.sub(r'^\W+|\W+$', '', description)
-                    
-                    # Skip short descriptions
-                    if len(description) < 3:
-                        continue
-                    
-                    # Extract UOM if present
-                    uom = None
-                    if uom_col_index is not None and len(parts) > uom_col_index:
-                        uom = parts[uom_col_index].strip()
-                    
-                    items.append({
-                        "description": description,
-                        "qty": qty,
-                        "rate": rate,
-                        "uom": uom  # Add UOM to item
-                    })
-                except Exception as e:
-                    continue
-        
-        return items
-
     def extract_charges(self, text):
         """Extract items from bill of charges format"""
         items = []
@@ -821,51 +858,45 @@ class InvoiceUpload(Document):
             return None
 
     def extract_source(self, text):
-        """Extract source (PO/SO number) with enhanced pattern matching (FIXED)"""
-        # 1. First look for Request for Quotation pattern
-        rfq_match = re.search(r'Request\s*for\s*Quotation\s*[#:]*\s*([A-Z0-9-]+)', text, re.IGNORECASE)
-        if rfq_match:
-            return rfq_match.group(1).strip()
-        
-        # 2. Look for PO/SO patterns
-        po_patterns = [
-            r'\b(?:PO|SO)[\s-]*([A-Z0-9-]{8,})',  # Minimum 8 chars
-            r'\b(?:Purchase|Sales)[\s-]*Order[\s-]*([A-Z0-9-]+)',
-            r'Order[\s-]*Number[\s-]*:\s*([A-Z0-9-]+)',
-            r'^[\s]*([A-Z]{2,}\d{4,}[-]?\d*)\s*$'  # Standalone PO pattern
+        """
+        Extract PO/SO (or RFQ) only from the invoice header,
+        ignoring anything in the items table below.
+        """
+        import re
+
+        # 1) Limit search to header (everything before first "DESCRIPTION")
+        upper = text.upper()
+        idx = upper.find("DESCRIPTION")
+        header = text[:idx] if idx != -1 else text
+
+        # 2) Try RFQ pattern first
+        rfq = re.search(
+            r'Request\s*for\s*Quotation\s*[#:]*\s*([A-Z0-9-]+)',
+            header, re.IGNORECASE
+        )
+        if rfq:
+            return rfq.group(1).strip()
+
+        # 3) Look for PO/SO patterns in header
+        patterns = [
+            r'\bPO[-\s]*([A-Z0-9-]{5,})\b',
+            r'\bSO[-\s]*([A-Z0-9-]{5,})\b',
+            r'Purchase\s*Order[-:\s]*([A-Z0-9-]+)',
+            r'Sales\s*Order[-:\s]*([A-Z0-9-]+)',
+            r'Order\s*Number[-:\s]*([A-Z0-9-]+)'
         ]
-        
-        for pattern in po_patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                po_value = match.group(1).strip()
-                if len(po_value) > 5:  # Minimum length for PO
-                    return po_value
-        
-        # 3. Table-based extraction as fallback
-        lines = text.splitlines()
-        order_keywords = [
-            "Source", "PO", "SO", "Order", "Book",
-            "Purchase Order", "Sales Order", "P.O.", "S.O.", "Request for Quotation"
-        ]
-        
-        for i, line in enumerate(lines):
-            if any(keyword in line for keyword in order_keywords):
-                if i + 1 < len(lines):
-                    value_line = lines[i + 1]
-                    
-                    if '|' in value_line:
-                        parts = [p.strip() for p in value_line.split('|') if p.strip()]
-                    else:
-                        parts = re.split(r'\s{2,}', value_line)
-                    
-                    if parts:
-                        # Find the most PO-like value
-                        for part in parts:
-                            if re.match(r'[A-Z]{2,}[-]?[A-Z0-9-]{6,}', part):
-                                return part.strip()
-        
+        for p in patterns:
+            m = re.search(p, header, re.IGNORECASE)
+            if m:
+                return m.group(1).strip()
+
+        # 4) Fallback: first standalone all-caps+digits code in header
+        standalone = re.findall(r'\b[A-Z]{2,}\d{2,}\b', header)
+        if standalone:
+            return standalone[0]
+
         return None
+
 
     def extract_reference(self, text):
         """Extract reference number from the invoice"""
@@ -1091,6 +1122,65 @@ class InvoiceUpload(Document):
         
         # Return match only if above confidence threshold
         return best_match if best_score > 80 else None
+    
+    def extract_table_items(self, text):
+        """
+        Extract items from a horizontal table using HEADER_FIELD_KEYWORDS.
+        """
+        import re
+        lines = text.splitlines()
+        header_map = {}
+        header_idx = None
+
+        # 1) Find header row by matching synonyms
+        for idx, line in enumerate(lines):
+            parts = line.split("|") if "|" in line else re.split(r"\s{2,}", line)
+            parts = [p.strip() for p in parts if p.strip()]
+
+            col_map = {}
+            for i, col in enumerate(parts):
+                uc = col.upper()
+                for field, kws in HEADER_FIELD_KEYWORDS.items():
+                    if any(k in uc for k in kws):
+                        col_map[field] = i
+
+            if {"description","quantity","price","amount"}.issubset(col_map):
+                header_map = col_map
+                header_idx = idx
+                break
+
+        if header_idx is None:
+            return []
+
+        # 2) Parse each row below header
+        items = []
+        for line in lines[header_idx+1:]:
+            if not line.strip() or re.match(r"(-{3,}|={3,})", line):
+                break
+
+            parts = line.split("|") if "|" in line else re.split(r"\s{2,}", line)
+            parts = [p.strip() for p in parts]
+
+            try:
+                desc      = parts[header_map["description"]]
+                qty       = float(parts[header_map["quantity"]].replace(",", ""))
+                price_str = parts[header_map["price"]].replace(",", "")
+                amt_str   = parts[header_map["amount"]].replace(",", "")
+
+                rate = float(price_str) if price_str else (float(amt_str)/qty if qty else 0.0)
+                uom  = parts[header_map["uom"]] if "uom" in header_map else None
+
+                items.append({
+                    "description": desc,
+                    "qty": qty,
+                    "rate": rate,
+                    "uom": uom
+                })
+            except Exception:
+                continue
+
+        return items
+
 
 
 @frappe.whitelist()
