@@ -28,6 +28,12 @@ class InvoiceUpload(Document):
         except Exception as e:
             frappe.db.set_value("Invoice Upload", self.name, "ocr_status", "Failed")
             frappe.db.commit()
+            # Roll back to Draft and mark OCR as Failed
+            frappe.db.set_value("Invoice Upload", self.name, {
+                 "docstatus": 0,
+                 "ocr_status": "Failed"
+             })
+            frappe.db.commit()
             error_message = f"Invoice Creation Failed: {str(e)}\n{traceback.format_exc()}"
             frappe.log_error(error_message, "Invoice Creation Failed")
             frappe.throw(f"Invoice creation failed: {str(e)}")
