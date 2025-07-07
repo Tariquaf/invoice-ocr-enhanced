@@ -89,8 +89,6 @@ def extract_pdf_text(file_path, min_chars=100):
     except Exception:
         return None
 
-import re
-
 def extract_items_section(text):
     """
     Return only the lines from the first description-synonym header
@@ -117,6 +115,25 @@ def extract_items_section(text):
 
     return "\n".join(lines[start:end])
 
+def preprocess_image(pil_img):
+    try:
+        img = np.array(pil_img.convert("RGB"))
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        scaled = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(scaled)
+        thresh = cv2.adaptiveThreshold(
+            enhanced, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, 15, 10
+        )
+        kernel = np.ones((3, 3), np.uint8)
+        processed = cv2.erode(thresh, kernel, iterations=1)
+        return processed
+    except Exception as e:
+        frappe.log_error(f"Debug image processing failed: {str(e)}", "OCR Debug Error")
+        return pil_img
+
 
 class InvoiceUpload(Document):
    
@@ -140,6 +157,89 @@ class InvoiceUpload(Document):
             frappe.log_error(error_message, "Invoice Creation Failed")
             frappe.throw(f"Invoice creation failed: {str(e)}")
 
+    def find_and_assign_party(self, raw_party):
+        """
+        Clean raw_party, look for exact match in Customer/Supplier.
+        Fallback to fuzzy match across both tables.
+        Sets self.party_type and self.party.
+        Returns True if a match was assigned, False otherwise.
+        """
+        clean_name = raw_party.split("\n", 1)[0].strip()
+        clean_name = re.sub(r'[^\w\s&\.-]', '', clean_name)
+        clean_name = re.sub(r'\s+', ' ', clean_name).strip()
+        lower_name = clean_name.lower()
+
+        # Exact match in Customer
+        if frappe.db.exists("Customer", {"customer_name": clean_name}):
+            self.party_type = "Customer"
+            self.party = clean_name
+            return True
+
+        # Exact match in Supplier
+        if frappe.db.exists("Supplier", {"supplier_name": clean_name}):
+            self.party_type = "Supplier"
+            self.party = clean_name
+            return True
+
+        # Fuzzy match both
+        candidates = []
+        for doctype, field in (("Customer", "customer_name"), ("Supplier", "supplier_name")):
+            for r in frappe.get_all(doctype, [field, "name"]):
+                raw_db = r.get(field) or ""
+                db_clean = re.sub(r'[^\w\s&\.-]', '', raw_db).lower().strip()
+                score = difflib.SequenceMatcher(None, lower_name, db_clean).ratio() * 100
+                if score >= 70:
+                    candidates.append({
+                        "doctype": doctype,
+                        "name": r["name"],
+                        "match_name": raw_db,
+                        "score": score
+                    })
+
+        if not candidates:
+            return False
+
+        best = max(candidates, key=lambda x: x["score"])
+        self.party_type = best["doctype"]
+        self.party = best["match_name"]
+
+        frappe.log_error(
+            f"Fuzzy party match: '{clean_name}' → {best['doctype']}/{best['name']} @ {best['score']:.0f}%",
+            "Invoice Upload: Party Match"
+        )
+        return True
+
+
+        # 3. Fuzzy candidates from both tables
+        candidates = []
+        for doctype, field in (("Customer", "customer_name"), ("Supplier", "supplier_name")):
+            for r in frappe.get_all(doctype, [field, "name"]):
+                raw_db = r.get(field) or ""
+                db_clean = re.sub(r'[^\w\s&\.-]', '', raw_db).lower().strip()
+                score = difflib.SequenceMatcher(None, lower_name, db_clean).ratio() * 100
+                if score >= 70:
+                    candidates.append({
+                        "doctype": doctype,
+                        "name": r["name"],
+                        "match_name": raw_db,
+                        "score": score
+                    })
+
+        # 4. No matches?
+        if not candidates:
+            return False
+
+        # 5. Pick top scoring match
+        best = max(candidates, key=lambda x: x["score"])
+        self.party_type = best["doctype"]
+        self.party      = best["match_name"]
+        frappe.log_error(
+            f"Fuzzy party match: '{clean_name}' → "
+            f"{best['doctype']}/{best['name']} @ {best['score']:.0f}%",
+            "Invoice Upload: Party Match"
+        )
+        return True
+
     def before_save(self):
         try:
             # Make submitted documents read-only
@@ -156,231 +256,117 @@ class InvoiceUpload(Document):
 
     def extract_invoice(self):
         try:
+            # ─── 1. Validate and resolve file path ───────────────────────────────
             if not self.file:
-                frappe.throw("No file attached.")
+                frappe.throw("No file attached to this invoice. Please upload a file before extracting.")
 
             start_time = time.time()
             file_path = get_file_path(self.file)
-            if not file_path:
-                frappe.throw(f"File path not found for: {self.file}")
-                
+            if not file_path or not os.path.exists(file_path):
+                frappe.throw(f"Unable to locate the uploaded file: {self.file}")
+
             text = ""
 
-            # Enhanced Odoo-style preprocessing
-            def preprocess_image(pil_img):
-                try:
-                    img = np.array(pil_img.convert("RGB"))
-                    channels = img.shape[-1] if img.ndim == 3 else 1
-                    
-                    if channels == 3:
-                        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-                    else:
-                        gray = img
-                        
-                    scaled = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-                    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-                    enhanced = clahe.apply(scaled)
-                    thresh = cv2.adaptiveThreshold(
-                        enhanced, 255,
-                        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                        cv2.THRESH_BINARY, 15, 10
-                    )
-                    kernel = np.ones((3, 3), np.uint8)
-                    processed = cv2.erode(thresh, kernel, iterations=1)
-                    return processed
-                except Exception as e:
-                    frappe.log_error(f"Image processing failed: {str(e)}", "OCR Error")
-                    return pil_img
-
-            # Get OCR config from site config or use default
+            # ─── 2. Choose OCR method: embedded PDF text or image-based ─────────
             ocr_config = frappe.conf.get("ocr_config", "--psm 4 --oem 3 -l eng+urd")
+            file_is_pdf = file_path.lower().endswith(".pdf")
 
-            if file_path.endswith(".pdf"):
-                # Convert only first 3 pages to prevent timeouts
-                images = convert_from_path(file_path, dpi=200, first_page=1, last_page=3)
-                for img in images:
-                    if time.time() - start_time > 120:  # 2-minute timeout
-                        frappe.throw("OCR processing timed out. Try with smaller file or fewer pages.")
-                    
-                    processed = preprocess_image(img)
-                    page_text = pytesseract.image_to_string(processed, config=ocr_config)
-                    text += page_text
-                    img.close()  # Free memory immediately
-            if file_path.endswith(".pdf"):
-                # 1) Try embedded text first
+            if file_is_pdf:
+                # Try extracting embedded text first (faster and more accurate)
                 pdf_text = extract_pdf_text(file_path)
                 if pdf_text:
                     text = pdf_text
                 else:
-                # 2) Fallback to OCR on pages 1–3
-                    start_time = time.time()
-                    text = ""
+                    # No embedded text? Fallback to OCR on first 3 pages
                     images = convert_from_path(file_path, dpi=200, first_page=1, last_page=3)
                     for img in images:
                         if time.time() - start_time > 120:
-                            frappe.throw("OCR processing timed out. Try with smaller file or fewer pages.")
+                            frappe.throw("OCR timed out. Try using a smaller file or limit to fewer pages.")
                         processed = preprocess_image(img)
                         text += pytesseract.image_to_string(processed, config=ocr_config)
                         img.close()
-            
             else:
+                # Treat as a single image input
                 img = Image.open(file_path)
                 try:
-                    # Convert PIL image to OpenCV format
-                    image_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-
-                    # Grayscale conversion
-                    gray = cv2.cvtColor(image_cv, cv2.COLOR_BGR2GRAY)
-
-                    # Thresholding to improve OCR accuracy
-                    _, thresh = cv2.threshold(
-                        gray, 150, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-                    )
-
-                    # Convert back to PIL for pytesseract
-                    processed_img = Image.fromarray(thresh)
-
-                    # OCR on processed image
+                    processed_img = preprocess_single_image(img)
                     text = pytesseract.image_to_string(processed_img, config=ocr_config)
                 finally:
                     img.close()
-                    
-            # Normalize vertical tables and save OCR text
+
+            if not text.strip():
+                frappe.throw("OCR failed to extract any content. Ensure the document quality is good.")
+
+            # ─── 3. Normalize document layout ───────────────────────────────────
             text = flatten_vertical_table_dynamic(text)
-            self.raw_ocr_text = text[:10000]
-
-            # Carve out just the item-table section (and debug‐dump it)
             table_text = extract_items_section(text)
-            with open("/tmp/DEBUG_table.txt", "w") as f:
-                f.write(table_text)
 
-            # Try structured table extraction, else charges or fallback
+            # ─── 4. Extract line items using structured patterns ────────────────
             items = self.extract_table_items(table_text)
             if not items:
+                # If structured extraction fails, fallback to charge/item blocks
                 items = self.extract_charges(text) or self.extract_items_fallback(text)
 
-            # ===== EXTRACT METADATA =====
-            # Extract dates
+            if not items:
+                frappe.throw("No items found in the invoice. Double-check OCR quality or template alignment.")
+
+            # ─── 5. Extract header fields: dates, reference, source, rep ────────
             dates = self.extract_dates(text)
-            if dates:
-                self.invoice_date = dates.get("invoice_date") or self.invoice_date
-                self.due_date = dates.get("due_date") or self.due_date
-                self.delivery_date = dates.get("delivery_date") or self.delivery_date
-            
-            # Extract source and reference
-            self.source = self.extract_source(text) or self.source
-            self.reference = self.extract_reference(text) or self.reference
-            
-            # Extract representative
+            self.invoice_date     = dates.get("invoice_date")     or self.invoice_date
+            self.due_date         = dates.get("due_date")         or self.due_date
+            self.delivery_date    = dates.get("delivery_date")    or self.delivery_date
+            self.source           = self.extract_source(text)     or self.source
+            self.reference        = self.extract_reference(text)  or self.reference
             self.representative_name = self.extract_representative(text) or self.representative_name
-            
-            # Save immediately to capture metadata
-            # … after metadata extraction …
-            self.save()
 
-            # 1) carve out just the item‐table section
-            table_text = extract_items_section(text)
-
-            # 2) parse only that chunk
-            items = self.extract_table_items(table_text)
-
-            # 3) if no structured rows found, fall back
-            if not items:
-                items = self.extract_charges(text) or self.extract_items_fallback(text)
-
+            # ─── 6. Bundle all extracted data ──────────────────────────────────
             extracted_data = {
                 "items": items,
-                "party": None
+                "party": self.extract_party(text) or ""
             }
 
-            # Get all items for matching
+            # ─── 7. Assign matching party (Customer or Supplier) ────────────────
+            raw_party = extracted_data.get("party", "").strip()
+            if raw_party:
+                found = self.find_and_assign_party(raw_party)
+                if not found:
+                    frappe.log_error(
+                        f"Could not resolve Party for: '{raw_party}'",
+                        "Invoice Upload: Party Matching"
+                    )
+            # ─── 7.5 Populate child table with extracted items ──────────────────────
+            self.set("invoice_upload_item", [])  # Clear existing rows
             all_items = self.get_items_for_matching()
-            
-            self.set("invoice_upload_item", [])
-            seen_descriptions = set()  # Track seen descriptions to avoid duplicates
-            
-            for row in items:
-                # Skip empty or invalid descriptions
-                if not row["description"] or len(row["description"]) < 3:
-                    continue
-                    
-                # Normalize description for duplicate check
-                normalized_desc = re.sub(r'\W+', '', row["description"].lower())
-                
-                # Skip duplicate items
-                if normalized_desc in seen_descriptions:
-                    continue
-                seen_descriptions.add(normalized_desc)
-                
-                # First try to match text in square brackets (item codes)
-                bracket_match = None
-                bracket_text = self.extract_bracket_text(row["description"])
-                
-                # Try matching with bracket text first
-                if bracket_text:
-                    bracket_match = self.fuzzy_match_item(bracket_text, all_items)
-                    if bracket_match and bracket_match["score"] > 85:
-                        matched_item = bracket_match["item_name"]
-                        self.append("invoice_upload_item", {
-                            "ocr_description": row["description"],
-                            "qty": row["qty"],
-                            "rate": row["rate"],
-                            "ocr_uom": row.get("uom"),
-                            "item": matched_item
-                        })
-                        # Match UOM for this row
-                        child_rows = self.get("invoice_upload_item")
-                        last_row = child_rows[-1]
-                        if last_row.ocr_uom:
-                            matched_uom = self.fuzzy_match_uom(last_row.ocr_uom)
-                            last_row.uom = matched_uom
-                        continue
-                
-                # If bracket match not found, try full description
-                full_match = self.fuzzy_match_item(row["description"], all_items)
-                if full_match and full_match["score"] > 75:
-                    matched_item = full_match["item_name"]
-                else:
-                    matched_item = None
-                    
+
+            for item in items:
+                matched_item = self.fuzzy_match_item(item["description"], all_items)
+
                 self.append("invoice_upload_item", {
-                    "ocr_description": row["description"],
-                    "qty": row["qty"],
-                    "rate": row["rate"],
-                    "ocr_uom": row.get("uom"),
-                    "item": matched_item
+                    "ocr_description": item["description"],
+                    "qty": item.get("qty", 1),
+                    "rate": item.get("rate", 0.0),
+                    "uom": self.fuzzy_match_uom(item.get("uom")) if item.get("uom") else None,
+                    "item": matched_item["item_name"] if matched_item else None
                 })
-                
-                # Match UOM for this row
-                child_rows = self.get("invoice_upload_item")
-                last_row = child_rows[-1]
-                if last_row.ocr_uom:
-                    matched_uom = self.fuzzy_match_uom(last_row.ocr_uom)
-                    last_row.uom = matched_uom
 
-            # Extract party with fuzzy matching
-            party_name = self.extract_party(text)
-            if party_name:
-                party_match = self.fuzzy_match_party(party_name)
-                if party_match:
-                    extracted_data["party"] = party_match["name"]
-                else:
-                    extracted_data["party"] = party_name
-
+            # ─── 8. Save OCR output & mark status ──────────────────────────────
             self.extracted_data = json.dumps(extracted_data, indent=2)
             self.ocr_status = "Extracted"
             self.save()
-            frappe.msgprint("OCR Extraction completed. Please review data before submitting.")
-            
+
+            frappe.msgprint("OCR Extraction completed ✅\nPlease review and confirm before submitting.")
+
             return {
                 "status": "success",
                 "items": items,
-                "party": extracted_data["party"]
+                "party": self.party
             }
+
         except Exception as e:
             error_message = f"Extraction failed: {str(e)}\n{traceback.format_exc()}"
             frappe.log_error(error_message, "OCR Extraction Failed")
             frappe.throw(f"Extraction failed: {str(e)}")
+
 
     def ensure_party_exists(self):
         extracted = json.loads(self.extracted_data or '{}')
@@ -1090,38 +1076,35 @@ class InvoiceUpload(Document):
             for label, fieldname in field_map.items():
                 setattr(self, fieldname, fields.get(label))
 
-    def fuzzy_match_party(self, party_name):
-        """Fuzzy match party against existing parties"""
+    def fuzzy_match_party(self, party_name, min_score=70):
+        """Fuzzy match party; only accept if score ≥ min_score."""
         if not party_name:
             return None
-            
-        clean_name = party_name.lower().strip()
-        party_type = self.party_type
-        
-        # Get all parties of the specified type
-        if party_type == "Customer":
-            parties = frappe.get_all("Customer", fields=["name", "customer_name"])
-            names = [p["customer_name"] for p in parties]
+
+        clean_name = re.sub(r'[^\w\s&\.-]', '', party_name).lower().strip()
+
+        # Load parties (Customer or Supplier)…
+        if self.party_type == "Customer":
+            parties = frappe.get_all("Customer", ["name", "customer_name"])
+            key = "customer_name"
         else:
-            parties = frappe.get_all("Supplier", fields=["name", "supplier_name"])
-            names = [p["supplier_name"] for p in parties]
-            
-        # Find best match
+            parties = frappe.get_all("Supplier", ["name", "supplier_name"])
+            key = "supplier_name"
+
         best_match = None
-        best_score = 0
-        
-        for i, name in enumerate(names):
-            score = difflib.SequenceMatcher(None, clean_name, name.lower()).ratio() * 100
+        best_score = 0.0
+
+        for p in parties:
+            raw = p.get(key) or ""
+            clean_db = re.sub(r'[^\w\s&\.-]', '', raw).lower().strip()
+            score = difflib.SequenceMatcher(None, clean_name, clean_db).ratio() * 100
+
             if score > best_score:
                 best_score = score
-                best_match = {
-                    "name": parties[i]["name"],
-                    "score": score,
-                    "match_name": name
-                }
-        
-        # Return match only if above confidence threshold
-        return best_match if best_score > 80 else None
+                best_match = {"name": p["name"], "score": score, "match_name": raw}
+
+        # Only return if above your dynamic threshold
+        return best_match if best_score >= min_score else None
     
     def extract_table_items(self, text):
         """
@@ -1218,25 +1201,6 @@ def debug_ocr_preview(docname):
     try:
         doc = frappe.get_doc("Invoice Upload", docname)
         file_path = get_file_path(doc.file)
-
-        def preprocess_image(pil_img):
-            try:
-                img = np.array(pil_img.convert("RGB"))
-                gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-                scaled = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-                clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-                enhanced = clahe.apply(scaled)
-                thresh = cv2.adaptiveThreshold(
-                    enhanced, 255,
-                    cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                    cv2.THRESH_BINARY, 15, 10
-                )
-                kernel = np.ones((3, 3), np.uint8)
-                processed = cv2.erode(thresh, kernel, iterations=1)
-                return processed
-            except Exception as e:
-                frappe.log_error(f"Debug image processing failed: {str(e)}", "OCR Debug Error")
-                return pil_img
 
         text = ""
         if file_path.endswith(".pdf"):
