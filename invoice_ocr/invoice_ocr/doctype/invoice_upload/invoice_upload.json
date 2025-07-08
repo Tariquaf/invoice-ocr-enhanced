@@ -12,7 +12,6 @@
     "reference",
     "representative_name",
     "representative",
-    "create_invoice",
     "column_break_wauc",
     "file",
     "ocr_status",
@@ -84,11 +83,6 @@
       "fieldtype": "Link",
       "label": "Representative",
       "options": "User"
-    },
-    {
-      "fieldname": "create_invoice",
-      "fieldtype": "Button",
-      "label": "Create Invoice"
     },
     {
       "fieldname": "column_break_wauc",
