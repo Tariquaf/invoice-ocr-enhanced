@@ -3,6 +3,15 @@
 
 frappe.ui.form.on('Invoice Upload', {
     refresh(frm) {
+        // always remove any leftover button
+        frm.remove_custom_button(__('Extract from file'));
+
+        // if submitted, do nothing further
+        if (frm.doc.docstatus === 1) {
+            return;
+        }
+
+        // only show on saved docs with an attached file
         if (!frm.is_new() && frm.doc.file) {
             let $btn = frm.add_custom_button(
                 __('Extract from file'),
@@ -29,6 +38,7 @@ frappe.ui.form.on('Invoice Upload', {
                         </div>
                     `;
                     $('body').append(spinnerHtml);
+
                     if (!$('#spinner-style').length) {
                         $('<style id="spinner-style">')
                             .text(`
@@ -38,6 +48,7 @@ frappe.ui.form.on('Invoice Upload', {
                                 }
                             `).appendTo('head');
                     }
+
                     frappe.call({
                         method: "invoice_ocr.invoice_ocr.doctype.invoice_upload.invoice_upload.extract_invoice",
                         args: { docname: frm.doc.name },
@@ -57,7 +68,7 @@ frappe.ui.form.on('Invoice Upload', {
                 }
             );
 
-            // remove black background: use default (white) style
+            // style as large, transparent button
             $btn
               .removeClass('btn-xs btn-primary')
               .addClass('btn-default btn-lg')

@@ -618,6 +618,10 @@ class InvoiceUpload(Document):
         invoice_url = get_url_to_form(inv.doctype, inv.name)
         frappe.msgprint(f"<a href='{invoice_url}'>{inv.name}</a> created (Draft)")
 
+        # Add to activity with direct link
+        comment_txt = f"Created {inv.doctype}: <a href='{invoice_url}'>{inv.name}</a>"
+        self.add_comment('Info', comment_txt)
+    
     def get_expense_account(self):
         company = frappe.defaults.get_user_default("Company")
         account = frappe.db.get_value("Company", company, "default_expense_account")
