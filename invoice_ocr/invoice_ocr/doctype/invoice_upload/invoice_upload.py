@@ -376,7 +376,7 @@ class InvoiceUpload(Document):
             if not items:
                 frappe.msgprint("No items found automatically. Please add items manually.", 
                               alert=True, indicator="orange")
-                self.ocr_status = "Partially Extracted"
+                self.ocr_status = "Extracted"
                 self.save()
                 return {
                     "status": "partial_success",
