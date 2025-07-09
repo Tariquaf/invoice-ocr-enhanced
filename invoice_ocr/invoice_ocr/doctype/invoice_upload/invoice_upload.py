@@ -13,6 +13,9 @@ from frappe.utils.file_manager import get_file_path
 from frappe.model.document import Document
 from PIL import Image
 from frappe.utils import add_days, get_url_to_form, nowdate
+from frappe import _
+from frappe.exceptions import ValidationError
+from frappe.model.document import Document
 import time
 
 # Dynamic vertical table header flattening & lookup keywords
@@ -166,6 +169,20 @@ def safe_float(s):
 
 class InvoiceUpload(Document):
    
+    def before_submit(self):
+        """
+        Prevent Submit until OCR has set ocr_status = "Extracted".
+        Shows an orange message instead of the default red throw.
+        """
+        if self.ocr_status != "Extracted":
+            frappe.msgprint(
+                _("Please click “Extract from file” and wait until OCR status is “Extracted” before submitting."),
+                title=_("Extraction Required"),
+                indicator="orange"
+            )
+            # raise a ValidationError to stop the submission process
+            raise ValidationError
+
     def on_submit(self):
         try:
             self.reload()
