@@ -13,16 +13,337 @@ from frappe.utils.file_manager import get_file_path
 from frappe.model.document import Document
 from PIL import Image
 from frappe.utils import add_days, get_url_to_form, nowdate
+from frappe import _
+from frappe.exceptions import ValidationError
+from frappe.model.document import Document
 import time
+import openpyxl
+import tempfile
+from rapidfuzz import process, fuzz
+from frappe.utils import flt
 
+
+# 1) Define your required vs optional columns at the module top
+REQUIRED_COLUMNS = {
+    "description": "ocr_description",
+    "qty":         "qty",
+    "rate":        "rate",
+}
+OPTIONAL_COLUMNS = {
+    "uom": "ocr_uom",
+}
+
+from rapidfuzz import process, fuzz
+
+def find_best_item_match(description, threshold=20):
+    """
+    Fuzzy-match 'description' against Item names using rapidfuzz.
+    """
+    if not description:
+        return None
+
+    start = time.time()
+    items = frappe.get_all("Item", fields=["name"])
+    names = [d.name for d in items]
+    frappe.log_error(f"Rapid: matching “{description}” against {len(names)} items", "Fuzzy Debug")
+
+    # token_sort_ratio handles multi-word descriptions better
+    match, score, _ = process.extractOne(description, names, scorer=fuzz.token_sort_ratio)
+    elapsed = time.time() - start
+
+    frappe.log_error(
+        f"Rapid: “{description}” → (match={match}, score={score}) in {elapsed:.4f}s",
+        "Fuzzy Debug"
+    )
+
+    return match if score and score >= threshold else None
+
+# Dynamic vertical table header flattening & lookup keywords
+HEADER_FIELD_KEYWORDS = {
+    "description": ["DESCRIPTION", "PARTICULARS", "ITEM", "PRODUCT", "GOODS", "MATERIAL", "وصف", "البند", "الصنف"],
+    "uom":         ["UNIT", "UOM", "MEASURE", "UNIT OF MEASURE", "وحدة", "الوحدة", "مقياس"],
+    "quantity":    ["NO", "QTY", "QUANTITY", "COUNT", "العدد", "مقدار"],
+    "price":       ["UNIT PRICE", "PRICE", "RATE", "COST", "UNIT COST", "السعر", "معدل", "التكلفة"],
+    "amount":      ["TOTAL", "AMOUNT", "LINE TOTAL", "VALUE", "المبلغ", "القيمة", "الإجمالي"]
+}
+
+def flatten_vertical_table_dynamic(text):
+    """
+    Collapse N-line vertical tables into a single-line header plus one line per row,
+    using HEADER_FIELD_KEYWORDS to detect each column in any order.
+    """
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    flat = []
+    i = 0
+
+    while i + len(HEADER_FIELD_KEYWORDS) <= len(lines):
+        block = lines[i : i + len(HEADER_FIELD_KEYWORDS)]
+        mapping = {}
+        # match each block line to a header field
+        for idx, line in enumerate(block):
+            upper = line.upper()
+            for field, kws in HEADER_FIELD_KEYWORDS.items():
+                if field in mapping:
+                    continue
+                if any(key in upper for key in kws):
+                    mapping[field] = idx
+                    break
+
+        # if all headers found in this block, collapse header and rows
+        if set(mapping.keys()) == set(HEADER_FIELD_KEYWORDS.keys()):
+            # build header line
+            header_line = "  ".join(block[mapping[f]] for f in HEADER_FIELD_KEYWORDS)
+            flat.append(header_line)
+            i += len(HEADER_FIELD_KEYWORDS)
+
+            # collapse subsequent N-line rows until TOTAL encountered
+            while i + len(HEADER_FIELD_KEYWORDS) <= len(lines):
+                row = lines[i : i + len(HEADER_FIELD_KEYWORDS)]
+                desc = row[mapping["description"]].strip().upper()
+                if desc in ("TOTAL", "GRAND TOTAL"):
+                    break
+                row_line = "  ".join(row[mapping[f]] for f in HEADER_FIELD_KEYWORDS)
+                flat.append(row_line)
+                i += len(HEADER_FIELD_KEYWORDS)
+
+            continue
+
+        # not a vertical table header, copy line as-is
+        flat.append(lines[i])
+        i += 1
+
+    # append any trailing lines
+    flat.extend(lines[i:])
+    return "\n".join(flat)
+
+def extract_pdf_text(file_path, min_chars=100):
+    """
+    Try to pull embedded text from the first 3 pages of a PDF.
+    Return text if it's at least `min_chars` long; otherwise None.
+    """
+    try:
+        reader = PdfReader(file_path)
+        text = ""
+        for page in reader.pages[:3]:
+            text += (page.extract_text() or "") + "\n"
+        return text if len(text) >= min_chars else None
+    except Exception:
+        return None
+
+def extract_items_section(text):
+    """
+    Return only the lines from the first description-synonym header
+    through the final amount-synonym line (inclusive).
+    """
+    lines = text.splitlines()
+
+    # find start line (any description keyword)
+    start = None
+    for i, line in enumerate(lines):
+        if any(kw in line.upper() for kw in HEADER_FIELD_KEYWORDS["description"]):
+            start = i
+            break
+    if start is None:
+        return text
+
+    # find end line (any amount keyword at start or common section ends)
+    end = None
+    for i, line in enumerate(lines[start+1:], start+1):
+        line_upper = line.strip().upper()
+        if (any(line_upper.startswith(kw) for kw in HEADER_FIELD_KEYWORDS["amount"]) or
+            line_upper in ("PRODUCT", "PAYMENT TERMS", "PAYMENT COMMUNICATION") or
+            any(kw in line_upper for kw in ["SN/LN", "شرح", "تفصیل", "پروڈکٹ"])):
+            end = i
+            break
+    end = end or len(lines)
+
+    # Filter out non-item lines
+    filtered_lines = []
+    for line in lines[start:end]:
+        line_upper = line.upper()
+        if not any(kw in line_upper for kw in ["PARTNER NAME", "ORDER DATE", "PURCHASE ORDER", 
+                                              "SHIPPING ADDRESS", "INVOICE DATE", "DUE DATE"]):
+            filtered_lines.append(line)
+            
+    return "\n".join(filtered_lines)
+
+def preprocess_image(pil_img):
+    try:
+        img = np.array(pil_img.convert("RGB"))
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        scaled = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(scaled)
+        thresh = cv2.adaptiveThreshold(
+            enhanced, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, 15, 10
+        )
+        kernel = np.ones((3, 3), np.uint8)
+        processed = cv2.erode(thresh, kernel, iterations=1)
+        return processed
+    except Exception as e:
+        frappe.log_error(f"Debug image processing failed: {str(e)}", "OCR Debug Error")
+        return pil_img
+
+def safe_float(s):
+    """Convert cleaned numeric string to float, or None on error."""
+    try:
+        if s is None or s.strip() == "":
+            return None
+            
+        # Handle rupee symbols and commas
+        s = str(s).replace('Rs.', '').replace(',', '').strip()
+        
+        # Handle trailing letters (e.g., "1250.000kg")
+        s = re.sub(r'[a-zA-Z]+$', '', s)
+        
+        # Handle multiple decimal points
+        if s.count('.') > 1:
+            parts = s.split('.')
+            s = parts[0] + '.' + ''.join(parts[1:])
+            
+        return float(s)
+    except Exception:
+        return None
 
 class InvoiceUpload(Document):
+
+    def _extract_excel(self):
+        """
+        1) Load attached file, verify .xls/.xlsx
+        2) Normalize headers, parse each data row
+        3) Fuzzy‐match Description → Item Code
+        4) Append into invoice_upload_item child table
+        5) Mark ocr_status, save & commit
+        """
+        if not self.file:
+            frappe.throw(_("No file attached"), _("Attachment Required"))
+
+        # load the File and workbook
+        file_doc = frappe.get_doc("File", {"file_url": self.file})
+        path = file_doc.get_full_path()
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in (".xls", ".xlsx"):
+            frappe.throw(
+                _("Please attach an Excel file (.xls/.xlsx)"),
+                _("Invalid Format")
+            )
+
+        wb = openpyxl.load_workbook(path, data_only=True)
+        ws = wb.active
+
+        # read & normalize headers
+        raw_headers = [cell.value for cell in ws[1] if cell.value]
+        headers     = [h.strip().lower() for h in raw_headers]
+
+        # DEBUG: log normalized headers
+        frappe.log_error(
+            message=f"Normalized headers: {headers}",
+            title="Excel Import Debug"
+        )
+
+        # clear old child rows
+        self.set("invoice_upload_item", [])
+
+        unmatched = []
+        # iterate data rows
+        for idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+            if not any(row):
+                continue
+
+            # DEBUG: log raw row
+            frappe.log_error(
+                message=f"Row {idx} values: {row}",
+                title="Excel Import Debug"
+            )
+
+            row_dict = dict(zip(headers, row))
+
+            # DEBUG: log mapped row_dict
+            frappe.log_error(
+                message=f"Row {idx} dict: {row_dict}",
+                title="Excel Import Debug"
+            )
+
+            child_data = {}
+
+            # map Excel columns → doctype fields
+            column_map = REQUIRED_COLUMNS.copy()
+            column_map.update(OPTIONAL_COLUMNS)
+            for col_name, fieldname in column_map.items():
+
+                val = row_dict.get(col_name)
+                # numeric fields default to 0
+                if fieldname in ("qty", "rate", "amount"):
+                    child_data[fieldname] = val or 0
+                else:
+                    child_data[fieldname] = val or ""
+
+            # fuzzy‐match Description → Item Code
+            
+            desc = row_dict.get("description") or ""
+            matched_item = find_best_item_match(desc, threshold=30)
+
+            # 📋 LOG match result for Excel import
+            if matched_item:
+                score = fuzz.token_sort_ratio(desc, matched_item)
+                frappe.log_error(
+                    message=f"[Excel Import] Match succeeded → '{desc}' ↔ '{matched_item}' @ score={score}",
+                    title="Fuzzy Match (Excel)"
+                )
+            else:
+                frappe.log_error(
+                    message=f"[Excel Import] Match failed → No match for '{desc}' at threshold 30",
+                    title="Fuzzy Match (Excel)"
+                )
+
+            if matched_item:
+                child_data["item_code"] = matched_item
+            else:
+                unmatched.append(desc)
+
+            self.append("invoice_upload_item", child_data)
+
+        # optional: warn about any descriptions that failed to match
+        if unmatched:
+            frappe.msgprint(
+                _("Could not match these descriptions: {0}").format(", ".join(unmatched)),
+                title=_("Unmatched Items"),
+                indicator="orange"
+            )
+
+        # finalize
+        self.ocr_status = "Extracted"
+        self.save(ignore_permissions=True)
+        frappe.db.commit()
+
+        return {"status": "success", "docname": self.name}
+
+    def on_submit(self):
+        # your existing on_submit logic...
+        pass
+
    
+    def before_submit(self):
+        """
+        Prevent Submit until OCR has set ocr_status = "Extracted".
+        Shows an orange message instead of the default red throw.
+        """
+        if self.ocr_status != "Extracted":
+            frappe.msgprint(
+                _("Please click “Extract from file” and wait until OCR status is “Extracted” before submitting."),
+                title=_("Extraction Required"),
+                indicator="orange"
+            )
+            # raise a ValidationError to stop the submission process
+            raise ValidationError
+
     def on_submit(self):
         try:
             self.reload()
             # Create draft invoice on submit
-            self.create_invoice_from_child(submit_invoice=False)
+            self.create_invoice_from_child()  # No parameters needed now
             # Make document non-editable
             frappe.db.set_value("Invoice Upload", self.name, "docstatus", 1)
         except Exception as e:
@@ -31,6 +352,59 @@ class InvoiceUpload(Document):
             error_message = f"Invoice Creation Failed: {str(e)}\n{traceback.format_exc()}"
             frappe.log_error(error_message, "Invoice Creation Failed")
             frappe.throw(f"Invoice creation failed: {str(e)}")
+
+    def find_and_assign_party(self, raw_party):
+        """
+        Clean raw_party, look for exact match in Customer/Supplier.
+        Fallback to fuzzy match across both tables.
+        Sets self.party_type and self.party.
+        Returns True if a match was assigned, False otherwise.
+        """
+        # Clean party name - remove address information
+        clean_name = re.split(r'\n|Partner Address|, Partner', raw_party, flags=re.IGNORECASE)[0]
+        clean_name = re.sub(r'[^\w\s&\.-]', '', clean_name).strip()
+        clean_name = re.sub(r'\s+', ' ', clean_name)
+        lower_name = clean_name.lower()
+
+        # Exact match in Customer
+        if frappe.db.exists("Customer", {"customer_name": clean_name}):
+            self.party_type = "Customer"
+            self.party = clean_name
+            return True
+
+        # Exact match in Supplier
+        if frappe.db.exists("Supplier", {"supplier_name": clean_name}):
+            self.party_type = "Supplier"
+            self.party = clean_name
+            return True
+
+        # Fuzzy match both
+        candidates = []
+        for doctype, field in (("Customer", "customer_name"), ("Supplier", "supplier_name")):
+            for r in frappe.get_all(doctype, [field, "name"]):
+                raw_db = r.get(field) or ""
+                db_clean = re.sub(r'[^\w\s&\.-]', '', raw_db).lower().strip()
+                score = difflib.SequenceMatcher(None, lower_name, db_clean).ratio() * 100
+                if score >= 70:
+                    candidates.append({
+                        "doctype": doctype,
+                        "name": r["name"],
+                        "match_name": raw_db,
+                        "score": score
+                    })
+
+        if not candidates:
+            return False
+
+        best = max(candidates, key=lambda x: x["score"])
+        self.party_type = best["doctype"]
+        self.party = best["match_name"]
+
+        frappe.log_error(
+            f"Fuzzy party match: '{clean_name}' → {best['doctype']}/{best['name']} @ {best['score']:.0f}%",
+            "Invoice Upload: Party Match"
+        )
+        return True
 
     def before_save(self):
         try:
@@ -99,8 +473,6 @@ class InvoiceUpload(Document):
                     text += page_text
                     img.close()  # Free memory immediately
             else:
-                import cv2
-                import numpy as np
                 img = Image.open(file_path)
                 try:
                     # Convert PIL image to OpenCV format
@@ -138,16 +510,40 @@ class InvoiceUpload(Document):
             # Extract representative
             self.representative_name = self.extract_representative(text) or self.representative_name
             
+            # Extract party and set it to the document field
+            party_name = self.extract_party(text)
+            if party_name:
+                party_match = self.fuzzy_match_party(party_name)
+                if party_match:
+                    self.party = party_match["name"]  # Set matched party to document field
+                else:
+                    self.party = None  # Clear existing party if no match
+            else:
+                self.party = None  # Clear existing party if none extracted
+            
             # Save immediately to capture metadata
             self.save()
             # ===== END METADATA EXTRACTION =====
             
+            # Extract items using our multi-strategy approach
             items = self.extract_items(text)
+            
+            # Handle case where no items were automatically found
+            if not items:
+                frappe.msgprint("No items found automatically. Please add items manually.", 
+                              alert=True, indicator="orange")
+                self.ocr_status = "Extracted"
+                self.save()
+                return {
+                    "status": "partial_success",
+                    "message": "Metadata extracted but no items found. Please add items manually."
+                }
+            
             extracted_data = {
                 "items": items,
-                "party": None
+                "party": party_name
             }
-
+            self.extracted_data = json.dumps(extracted_data, indent=2)
             # Get all items for matching
             all_items = self.get_items_for_matching()
             
@@ -215,12 +611,18 @@ class InvoiceUpload(Document):
 
             # Extract party with fuzzy matching
             party_name = self.extract_party(text)
+            frappe.log_error(f"Extracted party name: {party_name}", "Party Extraction")
             if party_name:
                 party_match = self.fuzzy_match_party(party_name)
                 if party_match:
+                    frappe.log_error(f"Matched party: {party_match['name']} with score {party_match['score']}", "Party Matching")
                     extracted_data["party"] = party_match["name"]
                 else:
-                    extracted_data["party"] = party_name
+                    frappe.log_error(f"No match found for party: {party_name}", "Party Matching")
+                    self.party = None
+            else:
+                frappe.log_error("No party name extracted", "Party Extraction")
+                self.party = None
 
             self.extracted_data = json.dumps(extracted_data, indent=2)
             self.ocr_status = "Extracted"
@@ -236,6 +638,7 @@ class InvoiceUpload(Document):
             error_message = f"Extraction failed: {str(e)}\n{traceback.format_exc()}"
             frappe.log_error(error_message, "OCR Extraction Failed")
             frappe.throw(f"Extraction failed: {str(e)}")
+
 
     def ensure_party_exists(self):
         extracted = json.loads(self.extracted_data or '{}')
@@ -258,23 +661,30 @@ class InvoiceUpload(Document):
         # If no match found, throw error
         frappe.throw(f"Party '{party}' not found in the system. Please create it first.")
 
-    def create_invoice_from_child(self, submit_invoice=False):
-        """Create invoice, optionally submit it based on parameter"""
+    def create_invoice_from_child(self):
+        """Create invoice on document submit"""
         # Check if invoice already created
         if self.invoice_created:
             frappe.throw("Invoice already created for this document")
             
-        # Ensure party is set and exists
-        # self.ensure_party_exists()
-
         # Create the appropriate invoice type
-        if self.party_type == "Supplier":
-            inv = frappe.new_doc("Purchase Invoice")
-            inv.supplier = self.party
+        if self.party and self.party.strip():
+            if self.party_type == "Supplier":
+                inv = frappe.new_doc("Purchase Invoice")
+                inv.supplier = self.party
+            else:
+                inv = frappe.new_doc("Sales Invoice")
+                inv.customer = self.party
         else:
-            inv = frappe.new_doc("Sales Invoice")
-            inv.customer = self.party
+            # Create a generic invoice if party is not specified
+            if self.party_type == "Supplier":
+                inv = frappe.new_doc("Purchase Invoice")
+            else:
+                inv = frappe.new_doc("Sales Invoice")
             
+            frappe.msgprint("No party specified. Creating invoice with blank party field.", 
+                        alert=True, indicator="orange")
+
         # SET REPRESENTATIVE
         if self.representative:
             inv.contact_person = self.representative
@@ -287,7 +697,8 @@ class InvoiceUpload(Document):
         else:  # Supplier/Purchase Invoice
             inv.remarks = self.source or ""  # Source → Remarks
             inv.bill_no = self.reference or self.name  # Reference → Bill No
-            inv.bill_date = self.invoice_date  # Invoice Date → Bill Date
+            if self.invoice_date:
+                inv.bill_date = self.invoice_date  # Invoice Date → Bill Date
         # ===== END: CHANGED SOURCE/REFERENCE MAPPING =====
 
         # Get appropriate account based on invoice type
@@ -355,28 +766,35 @@ class InvoiceUpload(Document):
         inv.run_method("set_missing_values")
         inv.run_method("calculate_taxes_and_totals")
         
-        # Save invoice with appropriate validation
+        # Save invoice as draft
         try:
-            # Bypass validations for draft invoices
+            # Bypass validations for draft invoice creation
             inv.flags.ignore_validate = True
             inv.flags.ignore_mandatory = True
             inv.insert(ignore_permissions=True)
-            status = "Draft"
         except Exception as e:
-            frappe.msgprint(f"Invoice creation failed: {str(e)}", alert=True, indicator="red")
-            frappe.log_error(f"Invoice creation failed: {str(e)}", "Invoice Creation Error")
-            return
+            # Log error but don't prevent document submission
+            error_msg = f"Invoice creation failed: {str(e)}"
+            frappe.msgprint(error_msg, alert=True, indicator="red")
+            frappe.log_error(error_msg, "Invoice Creation Error")
+            raise  # Re-raise exception to prevent document submission
         
         # Update status and reference
         frappe.db.set_value(self.doctype, self.name, {
             "invoice_created": 1,
             "invoice_reference": inv.name,
             "invoice_type": inv.doctype,
-            "invoice_status": status
+            "invoice_status": "Draft"
         })
 
-        frappe.msgprint(f"<a href='{get_url_to_form(inv.doctype, inv.name)}'>{inv.name}</a> created ({status})")
+        # Create clickable link to the invoice
+        invoice_url = get_url_to_form(inv.doctype, inv.name)
+        frappe.msgprint(f"<a href='{invoice_url}'>{inv.name}</a> created (Draft)")
 
+        # Add to activity with direct link
+        comment_txt = f"Created {inv.doctype}: <a href='{invoice_url}'>{inv.name}</a>"
+        self.add_comment('Info', comment_txt)
+    
     def get_expense_account(self):
         company = frappe.defaults.get_user_default("Company")
         account = frappe.db.get_value("Company", company, "default_expense_account")
@@ -476,7 +894,6 @@ class InvoiceUpload(Document):
             frappe.log_error(f"extract_representative failed: {str(e)}\n{traceback.format_exc()}", "Representative Extraction Error")
             return None
 
-
     def fuzzy_match_representative(self, name):
         """Fuzzy match representative name to users"""
         if not name:
@@ -508,192 +925,261 @@ class InvoiceUpload(Document):
         return best_match if best_score > 75 else None
 
     def extract_items(self, text):
-        # First try to extract as structured table items
-        table_items = self.extract_table_items(text)
+        # First try enhanced table extraction
+        table_items = self.extract_table_items_enhanced(text)
         if table_items:
             return table_items
 
-        # Then try to extract as bill of charges
+        # Try fallback table extraction
+        table_items = self.extract_table_items_fallback(text)
+        if table_items:
+            return table_items
+
+        # Then try bill of charges extraction
         charge_items = self.extract_charges(text)
         if charge_items:
             return charge_items
 
-        # Fallback to context-aware extraction
-        return self.extract_items_fallback(text)
+        # Finally, use context-aware extraction
+        return self.extract_items_context_aware(text)
 
-    def extract_items_fallback(self, text):
-        """Safe fallback that only looks in the item section with UOM extraction"""
-        items = []
-        
-        # Find the start of items section
-        start_index = text.find("DESCRIPTION")
-        if start_index == -1:
-            start_index = text.find("PARTICULARS")
-        if start_index == -1:
-            start_index = text.find("PRODUCT")
-        if start_index == -1:
-            start_index = 0
-            
-        # Find the end of items section
-        end_index = text.find("Total", start_index)
-        if end_index == -1:
-            end_index = text.find("Subtotal", start_index)
-        if end_index == -1:
-            end_index = text.find("Payment", start_index)
-        if end_index == -1:
-            end_index = len(text)
-            
-        # Focus only on the item section
-        item_section = text[start_index:end_index]
-        
-        # Look for quantity patterns in the item section with UOM
-        # New regex pattern to capture quantity, UOM, and rate
-        qty_matches = re.finditer(
-            r'(\d+,\d+\.\d{3}|\d+\.\d{3}|\d+)\s*([a-zA-Z]{1,10})?\s+(\d+,\d+\.\d{2,3}|\d+\.\d{2,3}|\d+)',
-            item_section, 
-            re.IGNORECASE
-        )
-        
-        for match in qty_matches:
-            try:
-                qty_str = match.group(1).replace(',', '')
-                qty = float(qty_str)
-                
-                # Capture UOM if present
-                uom = match.group(2) if match.group(2) else None
-                
-                # Get the full line
-                line_start = item_section.rfind('\n', 0, match.start()) + 1
-                line_end = item_section.find('\n', match.end())
-                full_line = item_section[line_start:line_end].strip()
-                
-                # Extract description (everything before quantity)
-                description = full_line.split(match.group(0))[0].strip()
-                
-                # Clean up description
-                description = re.sub(r'^\W+|\W+$', '', description)
-                description = re.sub(r'\s+', ' ', description)
-                description = re.sub(r'\.{3,}', '', description)
-                
-                # Skip short descriptions
-                if len(description) < 3:
-                    continue
-                
-                # Extract rate from the match
-                rate_str = match.group(3).replace(',', '')
-                rate = float(rate_str)
-                
-                items.append({
-                    "description": description,
-                    "qty": qty,
-                    "rate": rate,
-                    "uom": uom  # Add UOM to item
-                })
-            except Exception as e:
-                frappe.log_error(f"Item extraction failed: {str(e)}", "Item Extraction Error")
-                continue
-        
-        return items
-
-    def extract_table_items(self, text):
-        """Extract items from structured tables with UOM support"""
+    def extract_table_items_enhanced(self, text):
+        """Enhanced table extraction with multi-strategy detection"""
         items = []
         lines = text.splitlines()
         
-        # Find the start of the items table
-        start_index = -1
+        # Strategy 1: Header-based detection
         header_patterns = [
             r"DESCRIPTION.*QUANTITY.*UOM.*UNIT PRICE.*AMOUNT",
             r"PARTICULARS.*QUANTITY.*UOM.*RATE.*AMOUNT",
             r"ITEM.*QTY.*UOM.*PRICE.*TOTAL",
             r"DESCRIPTION.*QUANTITY.*UNIT PRICE.*AMOUNT",
             r"PARTICULARS.*QUANTITY.*RATE.*AMOUNT",
-            r"ITEM.*QTY.*PRICE.*TOTAL"
+            r"ITEM.*QTY.*PRICE.*TOTAL",
+            r"PRODUCT.*QUANTITY.*PRICE.*TOTAL",
+            r"GOODS.*QTY.*RATE.*AMOUNT",
+            r"ARTICLES.*QUANTITY.*PRICE.*TOTAL"
         ]
         
-        header_parts = None
-        uom_col_index = None
-        
+        # Find header line
+        start_index = -1
         for i, line in enumerate(lines):
             for pattern in header_patterns:
                 if re.search(pattern, line, re.IGNORECASE):
                     start_index = i + 1
-                    # Split header to find UOM column
-                    if '|' in line:
-                        header_parts = [part.strip() for part in line.split('|')]
-                    else:
-                        header_parts = re.split(r'\s{2,}', line)
-                    
-                    # Find UOM column index
-                    for idx, part in enumerate(header_parts):
-                        if "UOM" in part.upper():
-                            uom_col_index = idx
-                            break
                     break
             if start_index != -1:
                 break
         
-        # If table header found, process subsequent lines
-        if start_index != -1:
-            for i in range(start_index, min(start_index + 20, len(lines))):
-                line = lines[i]
-                if not line.strip() or "---" in line or "===" in line:
+        # Strategy 2: Amount alignment detection
+        if start_index == -1:
+            amount_positions = []
+            for i, line in enumerate(lines):
+                if re.search(r'\d+\.\d{2,3}$', line):
+                    amount_positions.append(i)
+            
+            # Look for clustered amounts (likely a table)
+            if len(amount_positions) > 3:
+                start_index = max(0, amount_positions[0] - 5)
+        
+        # Strategy 3: Item code pattern detection
+        if start_index == -1:
+            for i, line in enumerate(lines):
+                if re.match(r'^[A-Z]{3,}\d{3,}', line) or re.match(r'^\d+\.\s+\w+', line):
+                    start_index = i
                     break
+        
+        if start_index == -1:
+            return items
+        
+        # Process lines from start_index to end or totals
+        for i in range(start_index, len(lines)):
+            line = lines[i].strip()
+            
+            # Stop conditions
+            if not line:
+                continue
+            if "TOTAL" in line.upper() or "GRAND" in line.upper() or "BALANCE" in line.upper():
+                break
+            if any(word in line.upper() for word in ["PAGE", "INVOICE", "DATE", "TERMS", "THANK"]):
+                continue
                 
-                # Split line by pipe character or multiple spaces
-                if '|' in line:
-                    parts = [part.strip() for part in line.split('|')]
+            # Try multiple splitting strategies
+            parts = []
+            if '|' in line:  # Pipe-delimited
+                parts = [p.strip() for p in line.split('|')]
+            elif '\t' in line:  # Tab-delimited
+                parts = [p.strip() for p in line.split('\t')]
+            else:  # Space-delimited
+                parts = re.split(r'\s{3,}', line)  # Split on 3+ spaces
+            
+            # Need at least 3 parts (description, qty, price)
+            if len(parts) < 3:
+                continue
+                
+            try:
+                # Extract description (first columns except last 2)
+                description = " ".join(parts[:-2]).strip()
+                
+                # If description is too short, use first column only
+                if len(description) < 3:
+                    description = parts[0].strip()
+                    qty_str = parts[1] if len(parts) > 1 else ""
+                    rate_str = parts[2] if len(parts) > 2 else ""
                 else:
-                    parts = re.split(r'\s{2,}', line)
+                    qty_str = parts[-2] if len(parts) >= 2 else ""
+                    rate_str = parts[-1] if len(parts) >= 1 else ""
                 
-                if len(parts) < 4:
+                # Skip header-looking lines
+                if "DESCRIPTION" in description.upper() or "QUANTITY" in description.upper():
                     continue
+                    
+                # Clean numeric values
+                qty_str = re.sub(r'[^\d\.]', '', qty_str.replace(',', ''))
+                rate_str = re.sub(r'[^\d\.]', '', rate_str.replace(',', ''))
                 
-                try:
-                    # Skip lines that are clearly not items
-                    if "Total" in parts[0] or "Subtotal" in parts[0] or "Grand" in parts[0]:
-                        continue
-                    
-                    # Combine description parts
-                    description = " ".join(parts[:-3]).strip()
-                    
-                    # Last three parts should be Qty, Rate, Amount
-                    qty_str = parts[-3].replace(',', '')
-                    rate_str = parts[-2].replace(',', '')
-                    
-                    # Extract quantity number
-                    qty_match = re.search(r'(\d+\.\d{3}|\d+)', qty_str)
-                    if not qty_match:
-                        continue
-                    qty = float(qty_match.group(1))
-                    
-                    # Extract rate number
-                    rate_match = re.search(r'(\d+\.\d{2,3}|\d+)', rate_str)
-                    if not rate_match:
-                        continue
-                    rate = float(rate_match.group(1))
-                    
-                    # Clean up description
-                    description = re.sub(r'\.{3,}', '', description)
-                    description = re.sub(r'^\W+|\W+$', '', description)
-                    
-                    # Skip short descriptions
-                    if len(description) < 3:
-                        continue
-                    
-                    # Extract UOM if present
-                    uom = None
-                    if uom_col_index is not None and len(parts) > uom_col_index:
-                        uom = parts[uom_col_index].strip()
-                    
-                    items.append({
-                        "description": description,
-                        "qty": qty,
-                        "rate": rate,
-                        "uom": uom  # Add UOM to item
-                    })
-                except Exception as e:
+                # Skip if we can't parse numbers
+                if not qty_str or not rate_str:
                     continue
+                    
+                qty = float(qty_str)
+                rate = float(rate_str)
+                
+                # Skip zero quantities or rates
+                if qty == 0 or rate == 0:
+                    continue
+                    
+                # Clean description
+                description = re.sub(r'[^\w\s\-\.]', '', description)
+                description = re.sub(r'\s+', ' ', description).strip()
+                
+                # Skip invalid descriptions
+                if len(description) < 3 or description.isdigit():
+                    continue
+                    
+                # Extract UOM if available (likely after qty)
+                uom = None
+                if len(parts) >= 3:
+                    uom_candidate = parts[-3].strip()
+                    if re.match(r'^[A-Za-z]{1,5}$', uom_candidate):
+                        uom = uom_candidate
+                
+                items.append({
+                    "description": description,
+                    "qty": qty,
+                    "rate": rate,
+                    "uom": uom
+                })
+                
+            except Exception as e:
+                # Skip lines we can't parse
+                continue
+        
+        return items
+
+    def extract_table_items_fallback(self, text):
+        """Fallback table extraction for poorly structured tables"""
+        items = []
+        lines = text.splitlines()
+        
+        # Look for item lines with common patterns
+        item_pattern = r'(\d+)\s+([A-Za-z]{1,5})?\s+([\d,]+\.\d{2,3})'
+        
+        for line in lines:
+            match = re.search(item_pattern, line)
+            if not match:
+                continue
+                
+            try:
+                qty = float(match.group(1).replace(',', ''))
+                uom = match.group(2) if match.group(2) else None
+                rate = float(match.group(3).replace(',', ''))
+                
+                # Get description (text before the pattern)
+                desc_start = line.find(match.group(0))
+                description = line[:desc_start].strip()
+                
+                # Clean description
+                description = re.sub(r'[^\w\s\-\.]', '', description)
+                description = re.sub(r'\s+', ' ', description).strip()
+                
+                # Skip invalid descriptions
+                if len(description) < 3 or description.isdigit():
+                    continue
+                    
+                # Skip zero quantities or rates
+                if qty == 0 or rate == 0:
+                    continue
+                    
+                items.append({
+                    "description": description,
+                    "qty": qty,
+                    "rate": rate,
+                    "uom": uom
+                })
+            except:
+                continue
+        
+        return items
+
+    def extract_items_context_aware(self, text):
+        """Context-aware extraction with improved patterns"""
+        items = []
+        
+        # Find the start of items section
+        start_index = 0
+        section_keywords = ["DESCRIPTION", "PARTICULARS", "PRODUCT", "ITEM", "GOODS"]
+        for keyword in section_keywords:
+            idx = text.find(keyword)
+            if idx != -1:
+                start_index = idx + len(keyword)
+                break
+        
+        # Find the end of items section
+        end_index = len(text)
+        end_keywords = ["TOTAL", "SUBTOTAL", "GRAND TOTAL", "BALANCE", "PAYMENT"]
+        for keyword in end_keywords:
+            idx = text.find(keyword, start_index)
+            if idx != -1:
+                end_index = idx
+                break
+        
+        # Focus only on the item section
+        item_section = text[start_index:end_index]
+        
+        # Look for quantity patterns in the item section
+        pattern = r'(\d+\.\d{3}|\d+)\s*([a-zA-Z]{1,5})?\s+(\d+\.\d{2,3})'
+        matches = list(re.finditer(pattern, item_section))
+        
+        for match in matches:
+            try:
+                qty_str = match.group(1).replace(',', '')
+                qty = float(qty_str)
+                uom = match.group(2) if match.group(2) else None
+                rate_str = match.group(3).replace(',', '')
+                rate = float(rate_str)
+                
+                # Get description context
+                line_start = item_section.rfind('\n', 0, match.start()) + 1
+                line_end = item_section.find('\n', match.end())
+                full_line = item_section[line_start:line_end].strip()
+                
+                # Extract description (remove any trailing numbers/symbols)
+                description = full_line.split(match.group(0))[0].strip()
+                description = re.sub(r'[\d\W]+$', '', description).strip()
+                
+                # Skip short descriptions
+                if len(description) < 3 or description.isdigit():
+                    continue
+                    
+                items.append({
+                    "description": description,
+                    "qty": qty,
+                    "rate": rate,
+                    "uom": uom
+                })
+            except Exception as e:
+                continue
         
         return items
 
@@ -738,17 +1224,35 @@ class InvoiceUpload(Document):
         return items
 
     def fuzzy_match_uom(self, uom_text):
-        """Fuzzy match UOM text to standard UOMs"""
+        """Fuzzy match UOM text to standard UOMs with OCR error mapping"""
         if not uom_text:
             return None
             
+        # Map common OCR errors
+        uom_map = {
+            "kg": "Kg", "kgs": "Kg", "kg.": "Kg", "kilo": "Kg", "kilogram": "Kg",
+            "units": "Unit", "unit": "Unit", "unts": "Unit", "un": "Unit", "nos": "Nos",
+            "pcs": "Pcs", "pc": "Pcs", "pieces": "Pcs", "bags": "Bag", "bag": "Bag"
+        }
+        
         clean_text = uom_text.lower().strip()
+        if clean_text in uom_map:
+            return uom_map[clean_text]
+            
+        # Skip long strings that can't be UOM
+        if len(clean_text) > 15:
+            return None
+            
         uoms = frappe.get_all("UOM", fields=["name"])
         
         best_match = None
         best_score = 0
         
         for uom in uoms:
+            # Skip long UOMs
+            if len(uom.name) > 15:
+                continue
+                
             score = difflib.SequenceMatcher(None, clean_text, uom.name.lower()).ratio() * 100
             if score > best_score:
                 best_score = score
@@ -815,50 +1319,43 @@ class InvoiceUpload(Document):
             return None
 
     def extract_source(self, text):
-        """Extract source (PO/SO number) with enhanced pattern matching (FIXED)"""
-        # 1. First look for Request for Quotation pattern
-        rfq_match = re.search(r'Request\s*for\s*Quotation\s*[#:]*\s*([A-Z0-9-]+)', text, re.IGNORECASE)
-        if rfq_match:
-            return rfq_match.group(1).strip()
-        
-        # 2. Look for PO/SO patterns
-        po_patterns = [
-            r'\b(?:PO|SO)[\s-]*([A-Z0-9-]{8,})',  # Minimum 8 chars
-            r'\b(?:Purchase|Sales)[\s-]*Order[\s-]*([A-Z0-9-]+)',
-            r'Order[\s-]*Number[\s-]*:\s*([A-Z0-9-]+)',
-            r'^[\s]*([A-Z]{2,}\d{4,}[-]?\d*)\s*$'  # Standalone PO pattern
+        """
+        Extract PO/SO (or RFQ) only from the invoice header,
+        ignoring anything in the items table below.
+        """
+        import re
+
+        # 1) Limit search to header (everything before first "DESCRIPTION")
+        upper = text.upper()
+        idx = upper.find("DESCRIPTION")
+        header = text[:idx] if idx != -1 else text
+
+        # 2) Try RFQ pattern first
+        rfq = re.search(
+            r'Request\s*for\s*Quotation\s*[#:]*\s*([A-Z0-9-]+)',
+            header, re.IGNORECASE
+        )
+        if rfq:
+            return rfq.group(1).strip()
+
+        # 3) Look for PO/SO patterns in header
+        patterns = [
+            r'\bPO[-\s]*([A-Z0-9-]{5,})\b',
+            r'\bSO[-\s]*([A-Z0-9-]{5,})\b',
+            r'Purchase\s*Order[-:\s]*([A-Z0-9-]+)',
+            r'Sales\s*Order[-:\s]*([A-Z0-9-]+)',
+            r'Order\s*Number[-:\s]*([A-Z0-9-]+)'
         ]
-        
-        for pattern in po_patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                po_value = match.group(1).strip()
-                if len(po_value) > 5:  # Minimum length for PO
-                    return po_value
-        
-        # 3. Table-based extraction as fallback
-        lines = text.splitlines()
-        order_keywords = [
-            "Source", "PO", "SO", "Order", "Book",
-            "Purchase Order", "Sales Order", "P.O.", "S.O.", "Request for Quotation"
-        ]
-        
-        for i, line in enumerate(lines):
-            if any(keyword in line for keyword in order_keywords):
-                if i + 1 < len(lines):
-                    value_line = lines[i + 1]
-                    
-                    if '|' in value_line:
-                        parts = [p.strip() for p in value_line.split('|') if p.strip()]
-                    else:
-                        parts = re.split(r'\s{2,}', value_line)
-                    
-                    if parts:
-                        # Find the most PO-like value
-                        for part in parts:
-                            if re.match(r'[A-Z]{2,}[-]?[A-Z0-9-]{6,}', part):
-                                return part.strip()
-        
+        for p in patterns:
+            m = re.search(p, header, re.IGNORECASE)
+            if m:
+                return m.group(1).strip()
+
+        # 4) Fallback: first standalone all-caps+digits code in header
+        standalone = re.findall(r'\b[A-Z]{2,}\d{2,}\b', header)
+        if standalone:
+            return standalone[0]
+
         return None
 
     def extract_reference(self, text):
@@ -884,82 +1381,80 @@ class InvoiceUpload(Document):
             
         return None
 
-    import re
-
     def extract_party(self, text):
-        """Extract the actual partner name from the invoice text (OCR-tolerant)"""
-
-        # Normalize text spacing and remove carriage returns
-        text = text.replace('\r', '').replace('  ', ' ')
-
-        # Fix common OCR errors
-        def clean_common_ocr_errors(s):
-            s = s.replace(' lron ', ' Iron ')
-            s = s.replace(' lron', ' Iron')  # Edge case without spacing
-            return s
-
-        # 1. Try a global match anywhere in the text
-        partner_match = re.search(r'Partner\s*Name\s*[:\-]?\s*([A-Z][a-zA-Z\s&.,\-]+)', text, re.IGNORECASE)
-        if partner_match:
-            party = clean_common_ocr_errors(partner_match.group(1).strip())
-            if party:
-                return party
-
-        # 2. Fallback: line-by-line scan for "Partner Name"
-        for line in text.split('\n'):
-            if "partner name" in line.lower():
-                match = re.search(r'Partner\s*Name\s*[:\-]?\s*([A-Z][a-zA-Z\s&.,\-]+)', line, re.IGNORECASE)
-                if match:
-                    party = clean_common_ocr_errors(match.group(1).strip())
-                    if party:
-                        return party
-
-        # 3. Other common labels (Customer, Supplier, Invoice To, etc.)
-        party_labels = [
-            r"Invoice\s*To", r"Bill\s*To", r"Sold\s*To", r"Customer", r"Client", r"Supplier", r"Vendor"
+        """Robust party extraction with OCR error tolerance"""
+        # Normalize text for better matching
+        clean_text = re.sub(r'\s+', ' ', text)  # Collapse multiple spaces
+        clean_text = re.sub(r'[^\w\s\-\'&.,]', '', clean_text)  # Remove special chars but keep essential punctuation
+        
+        # 1. Direct label matching with OCR-tolerant patterns
+        patterns = [
+            r'Partner\s*Name\s*[:\-]?\s*([^\n\d]{10,50})',  # Increased length tolerance
+            r'Customer\s*Name\s*[:\-]?\s*([^\n\d]{10,50})',
+            r'Supplier\s*Name\s*[:\-]?\s*([^\n\d]{10,50})',
+            r'Bill\s*To\s*[:\-]?\s*([^\n\d]{10,50})',
+            r'Sold\s*To\s*[:\-]?\s*([^\n\d]{10,50})',
+            r'Invoice\s*To\s*[:\-]?\s*([^\n\d]{10,50})',
+            r'Client\s*[:\-]?\s*([^\n\d]{10,50})',
+            r'Vendor\s*[:\-]?\s*([^\n\d]{10,50})',
+            r'Supplier\s*[:\-]?\s*([^\n\d]{10,50})',
+            r'Customer\s*[:\-]?\s*([^\n\d]{10,50})'
         ]
-        for label in party_labels:
-            pattern = re.compile(fr'{label}\s*[:\-]?\s*([^\n]+)', re.IGNORECASE)
-            match = pattern.search(text)
+        
+        for pattern in patterns:
+            match = re.search(pattern, clean_text, re.IGNORECASE)
             if match:
-                party = clean_common_ocr_errors(match.group(1).strip())
-                party = re.sub(r'[^\w\s\-]$', '', party).strip()
-                if party:
-                    return party
-
-        # 4. Look for name in square brackets
-        bracket_match = re.search(r'\[([^\]]+)\]', text)
+                name = match.group(1).strip()
+                # Remove trailing invalid characters
+                name = re.sub(r'[^\w\s\-&.,]+$', '', name)
+                if len(name) > 5:  # Reasonable length check
+                    return name
+        
+        # 2. Multi-line extraction for better OCR tolerance
+        lines = clean_text.split('\n')
+        label_indices = []
+        labels = ["partner name", "customer name", "supplier name", 
+                 "bill to", "sold to", "invoice to", "client", "vendor"]
+        
+        # Find all possible label positions
+        for i, line in enumerate(lines):
+            if any(label in line.lower() for label in labels):
+                label_indices.append(i)
+        
+        # Check next line after each label
+        for idx in label_indices:
+            if idx + 1 < len(lines):
+                candidate = lines[idx+1].strip()
+                # Basic validation - should contain letters and spaces
+                if re.search(r'[a-zA-Z]{3}', candidate) and not re.search(r'\d{5,}', candidate):
+                    return candidate
+        
+        # 3. Look for name in square brackets (common in invoices)
+        bracket_match = re.search(r'\[([^\]]+)\]', clean_text)
         if bracket_match:
             candidate = bracket_match.group(1).strip()
-            if re.search(r'[a-zA-Z]', candidate) and ' ' in candidate and not re.search(r'\d{5,}', candidate):
-                return clean_common_ocr_errors(candidate)
-
-        # 5. Try to extract a name-like phrase near the top of the document
-        top_section = text.split("Invoice Date:")[0] if "Invoice Date:" in text else text[:500]
-        name_candidates = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b', top_section)
+            if re.search(r'[a-zA-Z]', candidate) and ' ' in candidate:
+                return candidate
+        
+        # 4. Top section name extraction
+        top_section = clean_text[:1000]  # First 1000 characters
+        # Look for uppercase words that might be a company name
+        name_candidates = re.findall(r'\b(?:[A-Z][a-z]+\s+){1,5}(?:Ltd|LLC|Inc|Co|GmbH|Pvt)\b', top_section)
         if name_candidates:
-            name_candidates.sort(key=len, reverse=True)
-            return clean_common_ocr_errors(name_candidates[0])
-
-        # 6. Scan for name near invoice ID
-        title_match = re.search(r'Invoice\s+\w+[\/\-]?\d+[\/\-]?\d*', text, re.IGNORECASE)
-        if title_match:
-            start_pos = max(0, title_match.start() - 150)
-            end_pos = min(len(text), title_match.end() + 150)
-            context = text[start_pos:end_pos]
-            name_candidates = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b', context)
+            return name_candidates[0]
+        
+        # 5. Near invoice number pattern
+        inv_match = re.search(r'Invoice\s+[A-Z0-9/-]+', clean_text, re.IGNORECASE)
+        if inv_match:
+            start = max(0, inv_match.start() - 100)
+            end = min(len(clean_text), inv_match.end() + 100)
+            context = clean_text[start:end]
+            name_candidates = re.findall(r'\b(?:[A-Z][a-z]+\s+){2,}\b', context)
             if name_candidates:
-                name_candidates.sort(key=len, reverse=True)
-                return clean_common_ocr_errors(name_candidates[0])
-
-        # 7. Urdu fallback (if OCR is multilingual)
-        urdu_match = re.search(r'(پارٹنر\s*نام|نام\s*خریدار)\s*[:\-]?\s*(.+)', text)
-        if urdu_match:
-            return urdu_match.group(2).strip()
-
+                # Return the longest candidate
+                return max(name_candidates, key=len)
+        
         return None
-
-
 
     def get_items_for_matching(self):
         """Get all items with their names and codes for matching"""
@@ -1054,11 +1549,17 @@ class InvoiceUpload(Document):
                 setattr(self, fieldname, fields.get(label))
 
     def fuzzy_match_party(self, party_name):
-        """Fuzzy match party against existing parties"""
+        """Fuzzy match with improved handling for OCR artifacts"""
         if not party_name:
             return None
             
-        clean_name = party_name.lower().strip()
+        # Clean name for matching - remove common OCR artifacts
+        clean_name = re.sub(r'(?i)\b(partner|address|invoice|inv|sb|,)\b', '', party_name)
+        clean_name = re.sub(r'[^\w\s]', '', clean_name).strip()
+        
+        if not clean_name:
+            return None
+            
         party_type = self.party_type
         
         # Get all parties of the specified type
@@ -1069,12 +1570,14 @@ class InvoiceUpload(Document):
             parties = frappe.get_all("Supplier", fields=["name", "supplier_name"])
             names = [p["supplier_name"] for p in parties]
             
-        # Find best match
+        # Find best match with multiple strategies
         best_match = None
         best_score = 0
         
+        # Strategy 1: Full name matching
         for i, name in enumerate(names):
-            score = difflib.SequenceMatcher(None, clean_name, name.lower()).ratio() * 100
+            clean_db_name = re.sub(r'[^\w\s]', '', name).lower()
+            score = difflib.SequenceMatcher(None, clean_name.lower(), clean_db_name).ratio() * 100
             if score > best_score:
                 best_score = score
                 best_match = {
@@ -1083,9 +1586,153 @@ class InvoiceUpload(Document):
                     "match_name": name
                 }
         
-        # Return match only if above confidence threshold
-        return best_match if best_score > 80 else None
-
+        # Accept if we have a good match
+        if best_score > 80:
+            return best_match
+            
+        # Strategy 2: Word-based matching
+        clean_words = set(clean_name.lower().split())
+        for i, name in enumerate(names):
+            clean_db_name = re.sub(r'[^\w\s]', '', name).lower()
+            db_words = set(clean_db_name.split())
+            
+            # Calculate Jaccard similarity
+            intersection = clean_words & db_words
+            union = clean_words | db_words
+            score = len(intersection) / len(union) * 100 if union else 0
+            
+            if score > best_score:
+                best_score = score
+                best_match = {
+                    "name": parties[i]["name"],
+                    "score": score,
+                    "match_name": name
+                }
+        
+        # Only return if we have a reasonable match
+        return best_match if best_score > 60 else None
+    
+    def extract_table_items(self, text):
+        """Extract items from structured tables with comprehensive scanning"""
+        items = []
+        lines = text.splitlines()
+        
+        # Find the start of the items table using more flexible patterns
+        start_index = -1
+        header_patterns = [
+            r"DESCRIPTION.*QUANTITY.*UOM.*UNIT PRICE.*AMOUNT",
+            r"PARTICULARS.*QUANTITY.*UOM.*RATE.*AMOUNT",
+            r"ITEM.*QTY.*UOM.*PRICE.*TOTAL",
+            r"DESCRIPTION.*QUANTITY.*UNIT PRICE.*AMOUNT",
+            r"PARTICULARS.*QUANTITY.*RATE.*AMOUNT",
+            r"ITEM.*QTY.*PRICE.*TOTAL",
+            r"PRODUCT.*QUANTITY.*PRICE.*TOTAL",
+            r"GOODS.*QTY.*RATE.*AMOUNT",
+            r"ARTICLES.*QUANTITY.*PRICE.*TOTAL"
+        ]
+        
+        # Find the header line
+        for i, line in enumerate(lines):
+            for pattern in header_patterns:
+                if re.search(pattern, line, re.IGNORECASE):
+                    start_index = i + 1
+                    break
+            if start_index != -1:
+                break
+        
+        # If no header found, try to find table by common prefixes
+        if start_index == -1:
+            for i, line in enumerate(lines):
+                if re.match(r'^\d+\s+\w+', line) or re.match(r'^[A-Z]{3,}\d+', line):
+                    start_index = i
+                    break
+        
+        # If still no start found, return empty
+        if start_index == -1:
+            return items
+        
+        # Process lines until we hit totals or end of table
+        in_table = True
+        i = start_index
+        while in_table and i < len(lines):
+            line = lines[i].strip()
+            i += 1
+            
+            # Skip empty lines and separators
+            if not line or line.startswith(('---', '===', '___', '***')):
+                continue
+                
+            # Stop at totals section
+            if "TOTAL" in line.upper() or "GRAND TOTAL" in line.upper() or "SUBTOTAL" in line.upper():
+                break
+                
+            # Skip lines that are clearly headers or footers
+            if any(word in line.upper() for word in ["PAGE", "INVOICE", "DATE", "TERMS"]):
+                continue
+                
+            # Split line by common separators
+            if '|' in line:
+                parts = [part.strip() for part in line.split('|')]
+            elif '\t' in line:
+                parts = [part.strip() for part in line.split('\t')]
+            else:
+                parts = re.split(r'\s{3,}', line)  # Split on 3+ spaces
+                
+            # Need at least description, quantity and rate
+            if len(parts) < 3:
+                continue
+                
+            try:
+                # Extract description (first columns except last 3)
+                description = " ".join(parts[:-3]).strip()
+                
+                # If description is too short, use first column only
+                if len(description) < 3:
+                    description = parts[0].strip()
+                    qty_str = parts[1] if len(parts) > 1 else ""
+                    rate_str = parts[2] if len(parts) > 2 else ""
+                else:
+                    qty_str = parts[-3] if len(parts) >= 3 else ""
+                    rate_str = parts[-2] if len(parts) >= 3 else ""
+                
+                # Clean numeric values
+                qty_str = re.sub(r'[^\d\.]', '', qty_str.replace(',', ''))
+                rate_str = re.sub(r'[^\d\.]', '', rate_str.replace(',', ''))
+                
+                # Skip if we can't parse numbers
+                if not qty_str or not rate_str:
+                    continue
+                    
+                qty = float(qty_str)
+                rate = float(rate_str)
+                
+                # Clean description
+                description = re.sub(r'[^\w\s\-\.]', '', description)
+                description = re.sub(r'\s+', ' ', description).strip()
+                
+                # Skip invalid descriptions
+                if len(description) < 3:
+                    continue
+                    
+                # Extract UOM if available (second last column)
+                uom = None
+                if len(parts) >= 4:
+                    uom_candidate = parts[-4].strip()
+                    if re.match(r'^[A-Za-z]{1,5}$', uom_candidate):
+                        uom = uom_candidate
+                
+                items.append({
+                    "description": description,
+                    "qty": qty,
+                    "rate": rate,
+                    "uom": uom
+                })
+                
+            except Exception as e:
+                # Skip lines we can't parse
+                continue
+        
+        return items
 
 @frappe.whitelist()
 def extract_invoice(docname):
@@ -1097,50 +1744,12 @@ def extract_invoice(docname):
         frappe.log_error(f"Extract invoice failed: {str(e)}", "Extract Invoice Error")
         return {"status": "error", "message": str(e)}
 
-
-@frappe.whitelist()
-def create_invoice(docname, submit_invoice=False):
-    """Create invoice from the Create Invoice button"""
-    try:
-        doc = frappe.get_doc("Invoice Upload", docname)
-        # Create draft invoice by default
-        doc.create_invoice_from_child(submit_invoice=submit_invoice)
-        return {
-            "status": "success",
-            "invoice_name": doc.invoice_reference,
-            "doctype": doc.invoice_type,
-            "status": doc.invoice_status
-        }
-    except Exception as e:
-        frappe.log_error(f"Create invoice failed: {str(e)}", "Create Invoice Error")
-        return {"status": "error", "message": str(e)}
-
-
 # Debug method to test OCR safely
 @frappe.whitelist()
 def debug_ocr_preview(docname):
     try:
         doc = frappe.get_doc("Invoice Upload", docname)
         file_path = get_file_path(doc.file)
-
-        def preprocess_image(pil_img):
-            try:
-                img = np.array(pil_img.convert("RGB"))
-                gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-                scaled = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-                clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-                enhanced = clahe.apply(scaled)
-                thresh = cv2.adaptiveThreshold(
-                    enhanced, 255,
-                    cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                    cv2.THRESH_BINARY, 15, 10
-                )
-                kernel = np.ones((3, 3), np.uint8)
-                processed = cv2.erode(thresh, kernel, iterations=1)
-                return processed
-            except Exception as e:
-                frappe.log_error(f"Debug image processing failed: {str(e)}", "OCR Debug Error")
-                return pil_img
 
         text = ""
         if file_path.endswith(".pdf"):
@@ -1167,3 +1776,81 @@ def debug_ocr_preview(docname):
     except Exception as e:
         frappe.log_error(f"OCR debug failed: {str(e)}", "OCR Debug Error")
         return f"Error: {str(e)}"
+    
+@frappe.whitelist()
+def extract_excel(docname):
+    # ✅ ADD FORMULA EVALUATION FUNCTION
+    def evaluate_excel_formula(cell):
+        if isinstance(cell, str) and cell.startswith('='):
+            try:
+                temp_wb = openpyxl.Workbook()
+                temp_ws = temp_wb.active
+                temp_ws['A1'] = cell
+                return temp_ws['A1'].value
+            except:
+                return None
+        return cell
+
+    # ✅ CORRECTED MAPPINGS
+    REQUIRED_COLUMNS = {
+        "description": "ocr_description",
+        "qty":         "qty",
+        "rate":        "rate",
+    }
+    OPTIONAL_COLUMNS = {
+        "uom": "ocr_uom",
+    }
+
+    doc = frappe.get_doc("Invoice Upload", docname)
+    file_doc = frappe.get_doc("File", {"file_url": doc.file})
+    path = file_doc.get_full_path()
+    
+    wb = openpyxl.load_workbook(path, data_only=False)  # Keep formulas
+    ws = wb.active
+
+    # Find header row
+    header_row_idx = None
+    for idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
+        titles = [str(c).strip().lower() if c else "" for c in row]
+        if set(REQUIRED_COLUMNS.keys()).issubset(set(titles)):
+            header_row_idx = idx
+            raw_headers = row
+            break
+
+    if not header_row_idx:
+        frappe.throw("Couldn't find required headers")
+
+    headers = [str(h).strip().lower() for h in raw_headers]
+    
+    # Build column map
+    column_map = REQUIRED_COLUMNS.copy()
+    for col, field in OPTIONAL_COLUMNS.items():
+        if col in headers:
+            column_map[col] = field
+
+    # Clear existing items
+    doc.set("invoice_upload_item", [])
+
+    # Process data rows
+    for row in ws.iter_rows(min_row=header_row_idx + 1, values_only=True):
+        if not any(row):
+            continue
+            
+        # ✅ EVALUATE FORMULAS
+        evaluated_row = [evaluate_excel_formula(cell) for cell in row]
+        row_dict = dict(zip(headers, evaluated_row))
+        
+        child_data = {}
+        for col_name, fieldname in column_map.items():
+            val = row_dict.get(col_name)
+            # Handle numeric fields
+            if fieldname in ("qty", "rate"):
+                child_data[fieldname] = flt(val) if val else 0
+            else:
+                child_data[fieldname] = str(val) if val else ""
+
+        doc.append("invoice_upload_item", child_data)
+
+    doc.ocr_status = "Extracted"
+    doc.save()
+    return {"status": "success"}

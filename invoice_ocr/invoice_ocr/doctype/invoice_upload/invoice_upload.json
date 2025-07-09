@@ -12,7 +12,6 @@
     "reference",
     "representative_name",
     "representative",
-    "create_invoice",
     "column_break_wauc",
     "file",
     "ocr_status",
@@ -35,7 +34,8 @@
       "fieldname": "party_type",
       "fieldtype": "Select",
       "label": "Party Type",
-      "options": "Customer\nSupplier"
+      "options": "\nCustomer\nSupplier",
+      "reqd": 1
     },
     {
       "fieldname": "invoice_date",
@@ -83,11 +83,6 @@
       "fieldtype": "Link",
       "label": "Representative",
       "options": "User"
-    },
-    {
-      "fieldname": "create_invoice",
-      "fieldtype": "Button",
-      "label": "Create Invoice"
     },
     {
       "fieldname": "column_break_wauc",
