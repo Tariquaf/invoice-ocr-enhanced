@@ -73,7 +73,7 @@ python3 ~/frappe-bench/apps/invoice_ocr/verify_dep.py
 ```bash
 deactivate
 ```
-# 4. Install the app on your site
+### Install the app on your site
 ```bash
 cd ~/frappe-bench
 bench --site yoursite.com install-app invoice_ocr
