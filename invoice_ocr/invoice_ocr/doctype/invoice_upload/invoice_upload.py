@@ -269,7 +269,10 @@ class InvoiceUpload(Document):
             child_data = {}
 
             # map Excel columns → doctype fields
-            for col_name, fieldname in HEADER_MAP.items():
+            column_map = REQUIRED_COLUMNS.copy()
+            column_map.update(OPTIONAL_COLUMNS)
+            for col_name, fieldname in column_map.items():
+
                 val = row_dict.get(col_name)
                 # numeric fields default to 0
                 if fieldname in ("qty", "rate", "amount"):
