@@ -17,6 +17,46 @@ from frappe import _
 from frappe.exceptions import ValidationError
 from frappe.model.document import Document
 import time
+import openpyxl
+import tempfile
+from rapidfuzz import process, fuzz
+from frappe.utils import flt
+
+
+# 1) Define your required vs optional columns at the module top
+REQUIRED_COLUMNS = {
+    "description": "ocr_description",
+    "qty":         "qty",
+    "rate":        "rate",
+}
+OPTIONAL_COLUMNS = {
+    "uom": "ocr_uom",
+}
+
+from rapidfuzz import process, fuzz
+
+def find_best_item_match(description, threshold=20):
+    """
+    Fuzzy-match 'description' against Item names using rapidfuzz.
+    """
+    if not description:
+        return None
+
+    start = time.time()
+    items = frappe.get_all("Item", fields=["name"])
+    names = [d.name for d in items]
+    frappe.log_error(f"Rapid: matching “{description}” against {len(names)} items", "Fuzzy Debug")
+
+    # token_sort_ratio handles multi-word descriptions better
+    match, score, _ = process.extractOne(description, names, scorer=fuzz.token_sort_ratio)
+    elapsed = time.time() - start
+
+    frappe.log_error(
+        f"Rapid: “{description}” → (match={match}, score={score}) in {elapsed:.4f}s",
+        "Fuzzy Debug"
+    )
+
+    return match if score and score >= threshold else None
 
 # Dynamic vertical table header flattening & lookup keywords
 HEADER_FIELD_KEYWORDS = {
@@ -168,6 +208,119 @@ def safe_float(s):
         return None
 
 class InvoiceUpload(Document):
+
+    def _extract_excel(self):
+        """
+        1) Load attached file, verify .xls/.xlsx
+        2) Normalize headers, parse each data row
+        3) Fuzzy‐match Description → Item Code
+        4) Append into invoice_upload_item child table
+        5) Mark ocr_status, save & commit
+        """
+        if not self.file:
+            frappe.throw(_("No file attached"), _("Attachment Required"))
+
+        # load the File and workbook
+        file_doc = frappe.get_doc("File", {"file_url": self.file})
+        path = file_doc.get_full_path()
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in (".xls", ".xlsx"):
+            frappe.throw(
+                _("Please attach an Excel file (.xls/.xlsx)"),
+                _("Invalid Format")
+            )
+
+        wb = openpyxl.load_workbook(path, data_only=True)
+        ws = wb.active
+
+        # read & normalize headers
+        raw_headers = [cell.value for cell in ws[1] if cell.value]
+        headers     = [h.strip().lower() for h in raw_headers]
+
+        # DEBUG: log normalized headers
+        frappe.log_error(
+            message=f"Normalized headers: {headers}",
+            title="Excel Import Debug"
+        )
+
+        # clear old child rows
+        self.set("invoice_upload_item", [])
+
+        unmatched = []
+        # iterate data rows
+        for idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+            if not any(row):
+                continue
+
+            # DEBUG: log raw row
+            frappe.log_error(
+                message=f"Row {idx} values: {row}",
+                title="Excel Import Debug"
+            )
+
+            row_dict = dict(zip(headers, row))
+
+            # DEBUG: log mapped row_dict
+            frappe.log_error(
+                message=f"Row {idx} dict: {row_dict}",
+                title="Excel Import Debug"
+            )
+
+            child_data = {}
+
+            # map Excel columns → doctype fields
+            for col_name, fieldname in HEADER_MAP.items():
+                val = row_dict.get(col_name)
+                # numeric fields default to 0
+                if fieldname in ("qty", "rate", "amount"):
+                    child_data[fieldname] = val or 0
+                else:
+                    child_data[fieldname] = val or ""
+
+            # fuzzy‐match Description → Item Code
+            
+            desc = row_dict.get("description") or ""
+            matched_item = find_best_item_match(desc, threshold=30)
+
+            # 📋 LOG match result for Excel import
+            if matched_item:
+                score = fuzz.token_sort_ratio(desc, matched_item)
+                frappe.log_error(
+                    message=f"[Excel Import] Match succeeded → '{desc}' ↔ '{matched_item}' @ score={score}",
+                    title="Fuzzy Match (Excel)"
+                )
+            else:
+                frappe.log_error(
+                    message=f"[Excel Import] Match failed → No match for '{desc}' at threshold 30",
+                    title="Fuzzy Match (Excel)"
+                )
+
+            if matched_item:
+                child_data["item_code"] = matched_item
+            else:
+                unmatched.append(desc)
+
+            self.append("invoice_upload_item", child_data)
+
+        # optional: warn about any descriptions that failed to match
+        if unmatched:
+            frappe.msgprint(
+                _("Could not match these descriptions: {0}").format(", ".join(unmatched)),
+                title=_("Unmatched Items"),
+                indicator="orange"
+            )
+
+        # finalize
+        self.ocr_status = "Extracted"
+        self.save(ignore_permissions=True)
+        frappe.db.commit()
+
+        return {"status": "success", "docname": self.name}
+
+    def on_submit(self):
+        # your existing on_submit logic...
+        pass
+
    
     def before_submit(self):
         """
@@ -1620,3 +1773,81 @@ def debug_ocr_preview(docname):
     except Exception as e:
         frappe.log_error(f"OCR debug failed: {str(e)}", "OCR Debug Error")
         return f"Error: {str(e)}"
+    
+@frappe.whitelist()
+def extract_excel(docname):
+    # ✅ ADD FORMULA EVALUATION FUNCTION
+    def evaluate_excel_formula(cell):
+        if isinstance(cell, str) and cell.startswith('='):
+            try:
+                temp_wb = openpyxl.Workbook()
+                temp_ws = temp_wb.active
+                temp_ws['A1'] = cell
+                return temp_ws['A1'].value
+            except:
+                return None
+        return cell
+
+    # ✅ CORRECTED MAPPINGS
+    REQUIRED_COLUMNS = {
+        "description": "ocr_description",
+        "qty":         "qty",
+        "rate":        "rate",
+    }
+    OPTIONAL_COLUMNS = {
+        "uom": "ocr_uom",
+    }
+
+    doc = frappe.get_doc("Invoice Upload", docname)
+    file_doc = frappe.get_doc("File", {"file_url": doc.file})
+    path = file_doc.get_full_path()
+    
+    wb = openpyxl.load_workbook(path, data_only=False)  # Keep formulas
+    ws = wb.active
+
+    # Find header row
+    header_row_idx = None
+    for idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
+        titles = [str(c).strip().lower() if c else "" for c in row]
+        if set(REQUIRED_COLUMNS.keys()).issubset(set(titles)):
+            header_row_idx = idx
+            raw_headers = row
+            break
+
+    if not header_row_idx:
+        frappe.throw("Couldn't find required headers")
+
+    headers = [str(h).strip().lower() for h in raw_headers]
+    
+    # Build column map
+    column_map = REQUIRED_COLUMNS.copy()
+    for col, field in OPTIONAL_COLUMNS.items():
+        if col in headers:
+            column_map[col] = field
+
+    # Clear existing items
+    doc.set("invoice_upload_item", [])
+
+    # Process data rows
+    for row in ws.iter_rows(min_row=header_row_idx + 1, values_only=True):
+        if not any(row):
+            continue
+            
+        # ✅ EVALUATE FORMULAS
+        evaluated_row = [evaluate_excel_formula(cell) for cell in row]
+        row_dict = dict(zip(headers, evaluated_row))
+        
+        child_data = {}
+        for col_name, fieldname in column_map.items():
+            val = row_dict.get(col_name)
+            # Handle numeric fields
+            if fieldname in ("qty", "rate"):
+                child_data[fieldname] = flt(val) if val else 0
+            else:
+                child_data[fieldname] = str(val) if val else ""
+
+        doc.append("invoice_upload_item", child_data)
+
+    doc.ocr_status = "Extracted"
+    doc.save()
+    return {"status": "success"}
