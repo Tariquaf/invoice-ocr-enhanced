@@ -4,6 +4,7 @@ pdf2image
 Pillow
 PyPDF2
 easyocr
+openpyxl
 
 # OpenCV and numerical computing
 opencv-python
@@ -12,6 +13,7 @@ numpy
 # String similarity
 fuzzywuzzy
 python-Levenshtein
+rapidfuzz
 
 # Web and I/O
 requests
