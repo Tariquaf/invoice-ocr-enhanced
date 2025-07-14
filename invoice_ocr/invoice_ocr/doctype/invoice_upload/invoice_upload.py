@@ -43,7 +43,7 @@ def find_best_item_match(description, threshold=20):
         return None
 
     start = time.time()
-    items = frappe.get_all("Item", fields=["name"])
+    items = frappe.get_all("Item", fields=["name"],filters={"has_variants": 0})
     names = [d.name for d in items]
     frappe.log_error(f"Rapid: matching “{description}” against {len(names)} items", "Fuzzy Debug")
 
@@ -314,44 +314,36 @@ class InvoiceUpload(Document):
             )
 
         # finalize
-        self.ocr_status = "Extracted"
-        self.save(ignore_permissions=True)
-        frappe.db.commit()
+    
+        # only update OCR status, child rows are already in-memory
+        self.db_set("ocr_status",
+            "Extracted" if all(r.item for r in self.invoice_upload_item)
+                        else "Partially Extracted"
+        )
 
         return {"status": "success", "docname": self.name}
 
-    def on_submit(self):
-        # your existing on_submit logic...
-        pass
-
-   
-    def before_submit(self):
-        """
-        Prevent Submit until OCR has set ocr_status = "Extracted".
-        Shows an orange message instead of the default red throw.
-        """
-        if self.ocr_status != "Extracted":
-            frappe.msgprint(
-                _("Please click “Extract from file” and wait until OCR status is “Extracted” before submitting."),
-                title=_("Extraction Required"),
-                indicator="orange"
-            )
-            # raise a ValidationError to stop the submission process
-            raise ValidationError
 
     def on_submit(self):
+        """
+        Create the Sales/Purchase Invoice. On failure, leave this Upload doc in Draft.
+        """
         try:
-            self.reload()
-            # Create draft invoice on submit
-            self.create_invoice_from_child()  # No parameters needed now
-            # Make document non-editable
-            frappe.db.set_value("Invoice Upload", self.name, "docstatus", 1)
+            self.create_invoice_from_child()
+            # Success → Frappe auto-sets docstatus = 1
         except Exception as e:
-            frappe.db.set_value("Invoice Upload", self.name, "ocr_status", "Failed")
+            # Mark the failure but do NOT submit
+            frappe.db.set_value(self.doctype, self.name, {
+                "ocr_status": "Failed",
+                "invoice_created": 0,
+                "invoice_status": "Error"
+            })
             frappe.db.commit()
-            error_message = f"Invoice Creation Failed: {str(e)}\n{traceback.format_exc()}"
-            frappe.log_error(error_message, "Invoice Creation Failed")
-            frappe.throw(f"Invoice creation failed: {str(e)}")
+            frappe.log_error(
+                f"Invoice creation failed: {e}\n{traceback.format_exc()}",
+                "Invoice Creation Failed"
+            )
+            frappe.throw(f"Invoice creation failed: {e}")
 
     def find_and_assign_party(self, raw_party):
         """
@@ -405,6 +397,13 @@ class InvoiceUpload(Document):
             "Invoice Upload: Party Match"
         )
         return True
+
+        # ADD THIS NEW METHOD TO THE CLASS:
+    def before_save(self):
+        """Prevent setting to Extracted if there are unmatched items"""
+        # Prevent setting to Extracted if there are unmatched items
+        if self.ocr_status == "Extracted" and not all(row.item for row in self.invoice_upload_item):
+            self.ocr_status = "Partially Extracted"
 
     def before_save(self):
         try:
@@ -531,8 +530,9 @@ class InvoiceUpload(Document):
             # Handle case where no items were automatically found
             if not items:
                 frappe.msgprint("No items found automatically. Please add items manually.", 
-                              alert=True, indicator="orange")
-                self.ocr_status = "Extracted"
+                            alert=True, indicator="orange")
+                # Set to Partially Extracted instead of Extracted
+                self.ocr_status = "Partially Extracted"
                 self.save()
                 return {
                     "status": "partial_success",
@@ -608,32 +608,21 @@ class InvoiceUpload(Document):
                 if last_row.ocr_uom:
                     matched_uom = self.fuzzy_match_uom(last_row.ocr_uom)
                     last_row.uom = matched_uom
+                
+                self.db_set("extracted_data", json.dumps(extracted_data, indent=2))
+                self.db_set("ocr_status", "Extracted")
+                # persist both the status and the newly appended child rows
+                self.extracted_data = json.dumps(extracted_data, indent=2)
+                self.ocr_status = "Extracted"
+                self.save()
 
-            # Extract party with fuzzy matching
-            party_name = self.extract_party(text)
-            frappe.log_error(f"Extracted party name: {party_name}", "Party Extraction")
-            if party_name:
-                party_match = self.fuzzy_match_party(party_name)
-                if party_match:
-                    frappe.log_error(f"Matched party: {party_match['name']} with score {party_match['score']}", "Party Matching")
-                    extracted_data["party"] = party_match["name"]
-                else:
-                    frappe.log_error(f"No match found for party: {party_name}", "Party Matching")
-                    self.party = None
-            else:
-                frappe.log_error("No party name extracted", "Party Extraction")
-                self.party = None
 
-            self.extracted_data = json.dumps(extracted_data, indent=2)
-            self.ocr_status = "Extracted"
-            self.save()
-            frappe.msgprint("OCR Extraction completed. Please review data before submitting.")
-            
             return {
                 "status": "success",
                 "items": items,
                 "party": extracted_data["party"]
             }
+
         except Exception as e:
             error_message = f"Extraction failed: {str(e)}\n{traceback.format_exc()}"
             frappe.log_error(error_message, "OCR Extraction Failed")
@@ -715,6 +704,15 @@ class InvoiceUpload(Document):
             item_code = row.item
             if not item_code:
                 frappe.msgprint(f"Skipping item: {row.ocr_description} - no item matched", alert=True)
+                continue
+
+             
+            if frappe.db.get_value("Item", item_code, "has_variants"):
+                frappe.msgprint(
+                    f"Skipping template item: {item_code} - please select a variant",
+                    alert=True,
+                    indicator="orange"
+                )
                 continue
 
             try:
@@ -1461,7 +1459,7 @@ class InvoiceUpload(Document):
         # Get all active items
         items = frappe.get_all("Item", 
                               fields=["item_code", "item_name"],
-                              filters={"disabled": 0})
+                              filters={"disabled": 0, "has_variants": 0})
         
         # Create a list of all possible names and codes
         item_data = []
@@ -1535,18 +1533,29 @@ class InvoiceUpload(Document):
         return None
     
     def validate(self):
-        if self.extracted_data:
-            fields = self.extract_fields_from_labeled_block(self.extracted_data)
-            
-            # Define a mapping from extracted labels to DocType field names
-            field_map = {
-                "Purchase Representative": "representative_name",
-         #       "Order Deadline": "order_deadline",
-                # Add more mappings here if needed
-            }
-            
-            for label, fieldname in field_map.items():
-                setattr(self, fieldname, fields.get(label))
+        # --- your existing field‐mapping code goes here ---
+        # e.g. looping over extracted_data, setting representative_name, etc.
+
+        # --- status upgrade logic ---
+        # If we’re “Partially Extracted” and now all rows have row.item set,
+        # bump status automatically to “Extracted”
+        if self.ocr_status == "Partially Extracted":
+            if all(r.item for r in self.invoice_upload_item):
+                self.ocr_status = "Extracted"
+                frappe.msgprint(
+                    _("Status upgraded to Extracted – all items matched"),
+                    indicator="green"
+                )
+
+        # Conversely, if somehow status is “Extracted” but now rows lost matches,
+        # you can downgrade back (optional):
+        elif self.ocr_status == "Extracted":
+            if not any(r.item for r in self.invoice_upload_item):
+                self.ocr_status = "Partially Extracted"
+                frappe.msgprint(
+                    _("Status downgraded – no matched items found"),
+                    indicator="orange"
+                )
 
     def fuzzy_match_party(self, party_name):
         """Fuzzy match with improved handling for OCR artifacts"""
@@ -1733,7 +1742,66 @@ class InvoiceUpload(Document):
                 continue
         
         return items
-
+    
+    def validate(self):
+        """Upgrade status when items are added to partially extracted document"""
+        # Existing validation code (if any)
+        if self.extracted_data:
+            fields = self.extract_fields_from_labeled_block(self.extracted_data)
+            # ... keep your existing field mapping code ...
+        
+        # NEW: Status upgrade logic
+        if self.ocr_status == "Partially Extracted":
+            # Check if any item has been matched
+            if all(row.item for row in self.invoice_upload_item):
+                self.ocr_status = "Extracted"
+                frappe.msgprint("Status upgraded to Extracted - items matched", 
+                            alert=True, indicator="green")
+                
+    def before_submit(self):
+        # 1) file
+        if not self.file:
+            frappe.msgprint(
+                _("Please attach an invoice file before submitting."),
+                title=_("File Required"),
+                indicator="orange"
+            )
+            
+        # 2) OCR
+        if self.ocr_status != "Extracted":
+            frappe.msgprint(
+                _("Please click “Extract from file” and wait until status is “Extracted”."),
+                title=_("Extraction Required"),
+                indicator="orange"
+            )
+            
+        # 3) items exist
+        if not self.invoice_upload_item:
+            frappe.msgprint(
+                _("No items were extracted. Please add items manually or correct the file."),
+                title=_("No Items Found"),
+                indicator="orange"
+            )
+            
+        # 4) all matched
+        unmatched = [r for r in self.invoice_upload_item if not r.item]
+        if unmatched:
+            names = ", ".join(r.ocr_description or "(empty)" for r in unmatched)
+            frappe.msgprint(
+                _("These items aren’t matched: {0}").format(names),
+                title=_("Unmatched Items"),
+                indicator="orange"
+            )
+            
+        # 5) party
+        if not (self.party_type and self.party):
+            frappe.msgprint(
+                _("Please select Party Type and Party before submitting."),
+                title=_("Party Required"),
+                indicator="orange"
+            )
+            
+    
 @frappe.whitelist()
 def extract_invoice(docname):
     try:
@@ -1790,17 +1858,7 @@ def extract_excel(docname):
             except:
                 return None
         return cell
-
-    # ✅ CORRECTED MAPPINGS
-    REQUIRED_COLUMNS = {
-        "description": "ocr_description",
-        "qty":         "qty",
-        "rate":        "rate",
-    }
-    OPTIONAL_COLUMNS = {
-        "uom": "ocr_uom",
-    }
-
+    
     doc = frappe.get_doc("Invoice Upload", docname)
     file_doc = frappe.get_doc("File", {"file_url": doc.file})
     path = file_doc.get_full_path()
@@ -1831,6 +1889,10 @@ def extract_excel(docname):
     # Clear existing items
     doc.set("invoice_upload_item", [])
 
+    # NEW: Track matched items
+    any_matched = False
+    unmatched = []
+    
     # Process data rows
     for row in ws.iter_rows(min_row=header_row_idx + 1, values_only=True):
         if not any(row):
@@ -1849,8 +1911,53 @@ def extract_excel(docname):
             else:
                 child_data[fieldname] = str(val) if val else ""
 
+        # NEW: Add fuzzy matching for items
+        desc = row_dict.get("description") or ""
+        if desc:
+            matched_item = find_best_item_match(desc, threshold=30)
+            if matched_item:
+                child_data["item"] = matched_item
+                any_matched = True
+            else:
+                unmatched.append(desc)
+
         doc.append("invoice_upload_item", child_data)
 
-    doc.ocr_status = "Extracted"
-    doc.save()
+    # NEW: Set appropriate status
+    if any_matched:
+        doc.ocr_status = "Extracted"
+    else:
+        doc.ocr_status = "Partially Extracted"
+        frappe.msgprint("Some items couldn't be matched. Please set them manually", 
+                      indicator="orange")
+
+    # NEW: Show unmatched items
+    if unmatched:
+        frappe.msgprint(
+            _("Could not match these descriptions: {0}").format(", ".join(unmatched)),
+            title=_("Unmatched Items"),
+            indicator="orange"
+        )
+   
+   # Persist only these fields — no full save
+    doc.ocr_status = "Extracted" if any_matched else "Partially Extracted"
+    doc.save()    # this commits both ocr_status and the child rows
+
     return {"status": "success"}
+
+@frappe.whitelist()
+def retry_submit(docname):
+    """
+    Rerun invoice‐creation WITHOUT re‐extracting or blowing away child rows.
+    """
+    import traceback
+    doc = frappe.get_doc("Invoice Upload", docname)
+    try:
+        doc.create_invoice_from_child()
+        # mark submitted
+        frappe.db.set_value("Invoice Upload", docname, "docstatus", 1)
+        frappe.db.commit()
+        return {"status": "success"}
+    except Exception as e:
+        frappe.log_error(traceback.format_exc(), "Retry Submit Failed")
+        return {"status": "error", "message": str(e)}
