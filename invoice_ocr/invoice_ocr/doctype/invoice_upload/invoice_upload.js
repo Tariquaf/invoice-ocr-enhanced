@@ -79,7 +79,21 @@ frappe.ui.form.on('Invoice Upload', {
            ? __('Re-run OCR scan with updated file or party')
            : __('Start invoice extraction from the uploaded file'));
     }
+  },
+  
+  // ====== ADDED BEFORE_SAVE HANDLER ======
+  before_save: function(frm) {
+    // Clear any previous refresh timers
+    if (frm.refresh_after_save) {
+      clearTimeout(frm.refresh_after_save);
+    }
+    
+    // Set timer to refresh form after save completes
+    frm.refresh_after_save = setTimeout(() => {
+      frm.reload_doc();
+    }, 1000);
   }
+  // ====== END OF ADDED HANDLER ======
 });
 
 // Helper to call server extraction
