@@ -60,10 +60,10 @@ def find_best_item_match(description, threshold=20):
 
 # Dynamic vertical table header flattening & lookup keywords
 HEADER_FIELD_KEYWORDS = {
-    "description": ["DESCRIPTION", "PARTICULARS", "ITEM", "PRODUCT", "GOODS", "MATERIAL", "وصف", "البند", "الصنف"],
+    "description": ["DESCRIPTION", "DESCRIPTION OF GOODS", "ITEM DESCRIPTION","PARTICULARS", "ITEM", "PRODUCT", "GOODS", "MATERIAL", "وصف", "البند", "الصنف"],
     "uom":         ["UNIT", "UOM", "MEASURE", "UNIT OF MEASURE", "وحدة", "الوحدة", "مقياس"],
-    "quantity":    ["NO", "QTY", "QUANTITY", "COUNT", "العدد", "مقدار"],
-    "price":       ["UNIT PRICE", "PRICE", "RATE", "COST", "UNIT COST", "السعر", "معدل", "التكلفة"],
+    "quantity":    ["NO", "QTY", "QUANTITY ORDERED", "QUANTITY", "COUNT", "العدد", "مقدار"],
+    "price":       ["UNIT PRICE", "PRICE PER UNIT", "PRICE", "RATE", "COST", "UNIT COST", "السعر", "معدل", "التكلفة"],
     "amount":      ["TOTAL", "AMOUNT", "LINE TOTAL", "VALUE", "المبلغ", "القيمة", "الإجمالي"]
 }
 
@@ -524,6 +524,12 @@ class InvoiceUpload(Document):
             self.save()
             # ===== END METADATA EXTRACTION =====
             
+            # Collapse any vertical (N-line) tables into single-line rows
+            text = flatten_vertical_table_dynamic(text)
+
+            # Collapse any vertical tables into single lines
+            text = flatten_vertical_table_dynamic(text)
+
             # Extract items using our multi-strategy approach
             items = self.extract_items(text)
             
@@ -1010,6 +1016,31 @@ class InvoiceUpload(Document):
                 parts = [p.strip() for p in line.split('\t')]
             else:  # Space-delimited
                 parts = re.split(r'\s{3,}', line)  # Split on 3+ spaces
+
+            # ───── 4-COLUMN SPECIAL CASE ─────
+            if len(parts) == 4:
+                desc = parts[0].strip()
+
+                # Split “qty UOM”
+                qty_tokens = parts[1].split()
+                qty = float(qty_tokens[0]) if qty_tokens else 0
+                uom = qty_tokens[1] if len(qty_tokens) > 1 else None
+
+                # Parse unit price (drop commas/Rs.)
+                unit_price = float(parts[2]
+                                .replace(',', '')
+                                .replace('Rs.', '')
+                                .strip())
+
+                items.append({
+                    "description": desc,
+                    "qty": qty,
+                    "rate": unit_price,
+                    "uom": uom
+                })
+                continue
+            # ───────────────────────────────────
+
             
             # Need at least 3 parts (description, qty, price)
             if len(parts) < 3:
