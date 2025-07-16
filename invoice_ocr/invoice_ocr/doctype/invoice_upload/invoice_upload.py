@@ -527,9 +527,6 @@ class InvoiceUpload(Document):
             # Collapse any vertical (N-line) tables into single-line rows
             text = flatten_vertical_table_dynamic(text)
 
-            # Collapse any vertical tables into single lines
-            text = flatten_vertical_table_dynamic(text)
-
             # Extract items using our multi-strategy approach
             items = self.extract_items(text)
             
